@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Drive API Video Player</title>
+  <!-- NoSleep.js to prevent screen dimming -->
+  <script src="https://cdn.jsdelivr.net/npm/nosleep.js@0.12.0/dist/NoSleep.min.js"></script>
   <style>
     body {
       background: #111;
@@ -28,22 +30,16 @@
       cursor: pointer;
     }
     button:hover { background: #17a84a; }
-    video {
-      width: 80%;
-      margin-top: 2rem;
-      border-radius: 10px;
-      box-shadow: 0 0 15px rgba(0,0,0,0.5);
-    }
     #loader { display: none; margin-top: 1rem; }
     #error { color: #f66; margin-top: 1rem; }
     #progress { margin-top: 1rem; width: 80%; height: 1rem; background: #444; border-radius: 5px; overflow: hidden; margin-left: auto; margin-right: auto; display: none; }
     #progress-bar { width: 0%; height: 100%; background: #1db954; }
 
-    /* New fixed video container */
+    /* Fixed video container */
     #videoContainer {
-      width: 800px;       /* Fixed width of the player */
-      height: 450px;      /* Fixed height */
-      background-color: black; /* black bars for portrait videos */
+      width: 800px;
+      height: 450px;
+      background-color: black;
       margin: 2rem auto 0;
       border-radius: 10px;
       box-shadow: 0 0 15px rgba(0,0,0,0.5);
@@ -52,13 +48,12 @@
       align-items: center;
       overflow: hidden;
     }
-
     #videoContainer video {
       width: 100%;
       height: 100%;
-      object-fit: contain; /* maintain aspect ratio */
-      background-color: black; /* ensures black bars */
-      border-radius: 0; /* container already has radius */
+      object-fit: contain;
+      background-color: black;
+      border-radius: 0;
     }
   </style>
 </head>
@@ -72,6 +67,9 @@
   <div id="videoContainer"></div>
 
   <script>
+    const noSleep = new NoSleep(); // Initialize NoSleep.js
+    let noSleepEnabled = false;
+
     function extractFileId(url) {
       const match = url.match(/[-\w]{25,}/);
       return match ? match[0] : null;
@@ -99,59 +97,38 @@
       }
 
       try {
-        // Ask server if video exists locally and get size
+        // Ask server if video exists locally (HEAD request)
         const metaRes = await fetch(`/video/${fileId}`, { method: "HEAD" });
         if (!metaRes.ok) throw new Error("Video not accessible");
 
-        const fileSize = parseInt(metaRes.headers.get("X-File-Size") || "0", 10);
-
-        if (fileSize > 100 * 1024 * 1024) {
-          // Show progress bar for large files
-          progress.style.display = "block";
-
-          // Poll server every second to see if file exists
-          await new Promise((resolve, reject) => {
-            const interval = setInterval(async () => {
-              try {
-                const check = await fetch(`/video/${fileId}`, { method: "HEAD" });
-                if (check.ok) {
-                  clearInterval(interval);
-                  resolve();
-                }
-              } catch (err) {
-                clearInterval(interval);
-                reject(err);
-              }
-            }, 1000);
-          });
-        }
-
         loader.style.display = "none";
-        progress.style.display = "none";
 
-        // ✅ Inline playback + unmute after play
+        // Insert video element with inline playback attributes
         container.innerHTML = `
-          <video
-            id="videoPlayer"
-            controls
-            autoplay
-            loop
-            muted
-            playsinline
-            webkit-playsinline
-          >
+          <video id="video" playsinline webkit-playsinline autoplay muted controls loop>
             <source src="/video/${fileId}" type="video/mp4">
             Your browser doesn't support HTML5 video.
           </video>
         `;
 
-        const video = document.getElementById("videoPlayer");
-        video.addEventListener("play", () => {
-          if (video.muted) {
-            video.muted = false;
-            video.volume = 1.0;
+        const video = document.getElementById("video");
+
+        // ✅ First tap (Play button) enables NoSleep + unmutes video
+        function enableVideoFeatures() {
+          if (!noSleepEnabled) {
+            noSleep.enable();       // prevent screen dimming
+            noSleepEnabled = true;
           }
-        });
+          video.muted = false;
+          video.volume = 1.0;
+          video.setAttribute("playsinline", "");
+          video.setAttribute("webkit-playsinline", "");
+          video.play().catch(() => {});
+          document.removeEventListener('click', enableVideoFeatures);
+        }
+
+        // Attach listener to the first click anywhere
+        document.addEventListener('click', enableVideoFeatures, { once: true });
 
       } catch (e) {
         loader.style.display = "none";
