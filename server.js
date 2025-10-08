@@ -25,11 +25,16 @@ let lastTempFile = null;
 // -------------------------
 function cleanupTempFiles() {
   const tmpDir = os.tmpdir();
+  const videoExts = [".mp4", ".mov", ".avi", ".mkv", ".webm"]; // add more if needed
+  let videosFound = false;
+
   fs.readdir(tmpDir, (err, files) => {
     if (err) return console.error("Error reading temp directory:", err);
 
     files.forEach(file => {
-      if (file.endsWith(".mp4")) {
+      const ext = path.extname(file).toLowerCase();
+      if (videoExts.includes(ext)) {
+        videosFound = true;
         const filePath = path.join(tmpDir, file);
         fs.unlink(filePath, (err) => {
           if (err) console.error("Failed to delete old temp video:", filePath);
@@ -37,8 +42,16 @@ function cleanupTempFiles() {
         });
       }
     });
+
+    if (!videosFound) {
+      console.log("No temp videos found to delete.");
+    } else {
+      console.log("Temp video cleanup complete.");
+    }
   });
 }
+
+
 
 // Run cleanup on server startup
 cleanupTempFiles();
