@@ -64,13 +64,24 @@
   <button onclick="loadVideo()">Play</button>
 
   <div style="margin-top:1rem;">
-    <label>Start Time:</label>
-    <input id="startTime" type="text" placeholder="e.g. 00:00:05" />
-    <label>End Time:</label>
-    <input id="endTime" type="text" placeholder="e.g. 00:00:20" />
+    <label>Start Time:</label><br>
+    <input type="number" id="startHours" min="0" max="23" value="0" style="width:60px;"> :
+    <input type="number" id="startMinutes" min="0" max="59" value="0" style="width:60px;"> :
+    <input type="number" id="startSeconds" min="0" max="59" value="0" style="width:60px;">
+  
+    <br><br>
+    <label>End Time:</label><br>
+    <input type="number" id="endHours" min="0" max="23" value="0" style="width:60px;"> :
+    <input type="number" id="endMinutes" min="0" max="59" value="0" style="width:60px;"> :
+    <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;">
+  
+    <br><br>
     <button onclick="previewTrim()">Preview Trim</button>
     <button onclick="downloadTrim()">Download Trim</button>
   </div>
+  
+  
+  
 
   <div id="loader">⏳ Loading...</div>
   <div id="progress"><div id="progress-bar"></div></div>
@@ -148,14 +159,41 @@
       }
     }
 
+    function sanitizeInput(id, max) {
+      const el = document.getElementById(id);
+      let val = parseInt(el.value, 10);
+      if (isNaN(val) || val < 0) val = 0;
+      if (val > max) val = max;
+      el.value = val; // ✅ always correct visually too
+      return val;
+    }
+
+    function formatTimeFromInputs(prefix) {
+      const h = sanitizeInput(prefix + "Hours", 23);
+      const m = sanitizeInput(prefix + "Minutes", 59);
+      const s = sanitizeInput(prefix + "Seconds", 59);
+      return h * 3600 + m * 60 + s;
+    }
+
     async function previewTrim() {
-      const start = document.getElementById("startTime").value.trim();
-      const end = document.getElementById("endTime").value.trim();
-      if (!currentFileId) return alert("Load a video first.");
-      if (!start || !end) return alert("Enter both start and end times.");
+      const error = document.getElementById("error");
+      error.textContent = "";
+
+      if (!currentFileId) {
+        error.textContent = "⚠️ Please load a video first.";
+        return;
+      }
+
+      const start = formatTimeFromInputs("start");
+      const end = formatTimeFromInputs("end");
+
+      if (end <= start) {
+        error.textContent = "⚠️ End time must be after start time.";
+        return;
+      }
 
       const container = document.getElementById("videoContainer");
-      container.innerHTML = "⏳ Processing preview...";
+      container.innerHTML = "⏳ Trimming preview...";
 
       try {
         const res = await fetch("/trim", {
@@ -163,6 +201,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ fileId: currentFileId, start, end, preview: true })
         });
+
         if (!res.ok) throw new Error("Trim failed");
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -172,18 +211,52 @@
             <source src="${url}" type="video/mp4">
           </video>
         `;
+        error.textContent = "";
       } catch (err) {
-        container.innerHTML = "❌ " + err.message;
+        container.innerHTML = "";
+        error.textContent = "❌ " + err.message;
       }
     }
 
     function downloadTrim() {
-      const start = document.getElementById("startTime").value.trim();
-      const end = document.getElementById("endTime").value.trim();
-      if (!currentFileId) return alert("Load a video first.");
-      if (!start || !end) return alert("Enter both start and end times.");
+      const error = document.getElementById("error");
+      error.textContent = "";
+
+      if (!currentFileId) {
+        error.textContent = "⚠️ Please load a video first.";
+        return;
+      }
+
+      const start = formatTimeFromInputs("start");
+      const end = formatTimeFromInputs("end");
+
+      if (end <= start) {
+        error.textContent = "⚠️ End time must be after start time.";
+        return;
+      }
+
       window.location.href = `/trim?fileId=${currentFileId}&start=${start}&end=${end}`;
     }
+
+
+
+    // 🔧 Auto-correct time inputs live as the user types
+    function clampValue(input, max) {
+      let val = parseInt(input.value, 10);
+      if (isNaN(val) || val < 0) val = 0;
+      if (val > max) val = max;
+      input.value = val;
+    }
+
+    // Apply live clamping to all hour/min/sec inputs
+    ["startHours","startMinutes","startSeconds","endHours","endMinutes","endSeconds"].forEach(id => {
+      const el = document.getElementById(id);
+      const max = id.includes("Hours") ? 23 : 59;
+      el.addEventListener("input", () => clampValue(el, max));
+    });
+
+
+
   </script>
 </body>
 
