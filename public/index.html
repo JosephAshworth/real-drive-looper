@@ -59,37 +59,59 @@
   </style>
 </head>
 <body>
-  <h1>🎥 Google Drive API Video Player</h1>
+  <h1>🎥 Google Drive API Video Player + Trimmer</h1>
   <input id="driveLink" placeholder="Paste Google Drive video link here">
   <button onclick="loadVideo()">Play</button>
+
+  <div style="margin-top:1rem;">
+    <label>Start Time:</label>
+    <input id="startTime" type="text" placeholder="e.g. 00:00:05" />
+    <label>End Time:</label>
+    <input id="endTime" type="text" placeholder="e.g. 00:00:20" />
+    <button onclick="previewTrim()">Preview Trim</button>
+    <button onclick="downloadTrim()">Download Trim</button>
+  </div>
+
   <div id="loader">⏳ Loading...</div>
   <div id="progress"><div id="progress-bar"></div></div>
   <div id="error"></div>
   <div id="videoContainer"></div>
 
   <script>
-    const noSleep = new NoSleep(); // Initialize NoSleep.js
+    const noSleep = new NoSleep();
     let noSleepEnabled = false;
+    let currentFileId = null;
 
     function extractFileId(url) {
-      const match = url.match(/[-\w]{25,}/);
-      return match ? match[0] : null;
+      try {
+        // Handles all major Drive link formats
+        const patterns = [
+          /\/d\/([a-zA-Z0-9_-]{25,})/,      // .../d/FILEID/...
+          /id=([a-zA-Z0-9_-]{25,})/,        // ?id=FILEID
+          /uc\?id=([a-zA-Z0-9_-]{25,})/,    // uc?id=FILEID
+        ];
+        for (const p of patterns) {
+          const m = url.match(p);
+          if (m) return m[1];
+        }
+        return null;
+      } catch {
+        return null;
+      }
     }
+
 
     async function loadVideo() {
       const link = document.getElementById("driveLink").value.trim();
       const fileId = extractFileId(link);
+      currentFileId = fileId;
       const container = document.getElementById("videoContainer");
       const error = document.getElementById("error");
       const loader = document.getElementById("loader");
-      const progress = document.getElementById("progress");
-      const progressBar = document.getElementById("progress-bar");
 
       error.textContent = "";
       container.innerHTML = "";
       loader.style.display = "block";
-      progress.style.display = "none";
-      progressBar.style.width = "0%";
 
       if (!fileId) {
         loader.style.display = "none";
@@ -98,45 +120,71 @@
       }
 
       try {
-        // Ask server if video exists locally (HEAD request)
         const metaRes = await fetch(`/video/${fileId}`, { method: "HEAD" });
         if (!metaRes.ok) throw new Error("Video not accessible");
 
         loader.style.display = "none";
-
-        // Insert video element with inline playback attributes
         container.innerHTML = `
-          <video id="video" playsinline webkit-playsinline autoplay muted controls loop>
+          <video id="video" playsinline autoplay muted controls loop>
             <source src="/video/${fileId}" type="video/mp4">
-            Your browser doesn't support HTML5 video.
           </video>
         `;
 
         const video = document.getElementById("video");
 
-        // ✅ First tap (Play button) enables NoSleep + unmutes video
-        function enableVideoFeatures() {
+        document.addEventListener("click", function enable() {
           if (!noSleepEnabled) {
-            noSleep.enable();       // prevent screen dimming
+            noSleep.enable();
             noSleepEnabled = true;
           }
           video.muted = false;
-          video.volume = 1.0;
-          video.setAttribute("playsinline", "");
-          video.setAttribute("webkit-playsinline", "");
-          video.play().catch(() => {});
-          document.removeEventListener('click', enableVideoFeatures);
-        }
-
-        // Attach listener to the first click anywhere
-        document.addEventListener('click', enableVideoFeatures, { once: true });
+          video.play().catch(()=>{});
+          document.removeEventListener("click", enable);
+        });
 
       } catch (e) {
         loader.style.display = "none";
-        progress.style.display = "none";
         error.textContent = "❌ " + e.message;
       }
     }
+
+    async function previewTrim() {
+      const start = document.getElementById("startTime").value.trim();
+      const end = document.getElementById("endTime").value.trim();
+      if (!currentFileId) return alert("Load a video first.");
+      if (!start || !end) return alert("Enter both start and end times.");
+
+      const container = document.getElementById("videoContainer");
+      container.innerHTML = "⏳ Processing preview...";
+
+      try {
+        const res = await fetch("/trim", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileId: currentFileId, start, end, preview: true })
+        });
+        if (!res.ok) throw new Error("Trim failed");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+
+        container.innerHTML = `
+          <video controls autoplay style="width:100%;border-radius:10px;">
+            <source src="${url}" type="video/mp4">
+          </video>
+        `;
+      } catch (err) {
+        container.innerHTML = "❌ " + err.message;
+      }
+    }
+
+    function downloadTrim() {
+      const start = document.getElementById("startTime").value.trim();
+      const end = document.getElementById("endTime").value.trim();
+      if (!currentFileId) return alert("Load a video first.");
+      if (!start || !end) return alert("Enter both start and end times.");
+      window.location.href = `/trim?fileId=${currentFileId}&start=${start}&end=${end}`;
+    }
   </script>
 </body>
+
 </html>

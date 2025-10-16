@@ -4,11 +4,14 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import os from "node:os";
+import { exec } from "child_process";
+import util from "util";  // ✅ Added for promisified exec
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY;
+const execPromise = util.promisify(exec); // ✅ for async ffmpeg commands
 
 if (!API_KEY) {
   console.error("❌ Missing GOOGLE_API_KEY in .env file");
@@ -16,6 +19,7 @@ if (!API_KEY) {
 }
 
 app.use(express.static("public"));
+app.use(express.json()); // ✅ Added for JSON parsing (needed for POST /trim)
 
 // Track last downloaded temp file
 let lastTempFile = null;
@@ -25,13 +29,13 @@ let lastTempFile = null;
 // -------------------------
 function cleanupTempFiles() {
   const tmpDir = os.tmpdir();
-  const videoExts = [".mp4", ".mov", ".avi", ".mkv", ".webm"]; // add more if needed
+  const videoExts = [".mp4", ".mov", ".avi", ".mkv", ".webm"];
   let videosFound = false;
 
   fs.readdir(tmpDir, (err, files) => {
     if (err) return console.error("Error reading temp directory:", err);
 
-    files.forEach(file => {
+    files.forEach((file) => {
       const ext = path.extname(file).toLowerCase();
       if (videoExts.includes(ext)) {
         videosFound = true;
@@ -43,15 +47,10 @@ function cleanupTempFiles() {
       }
     });
 
-    if (!videosFound) {
-      console.log("No temp videos found to delete.");
-    } else {
-      console.log("Temp video cleanup complete.");
-    }
+    if (!videosFound) console.log("No temp videos found to delete.");
+    else console.log("Temp video cleanup complete.");
   });
 }
-
-
 
 // Run cleanup on server startup
 cleanupTempFiles();
@@ -68,7 +67,7 @@ async function getFileMetadata(fileId) {
 }
 
 // -------------------------
-// Download large file to temp directory
+// Download file to temp directory
 // -------------------------
 async function downloadFile(fileId, filePath) {
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
@@ -118,48 +117,109 @@ function streamFile(req, res, filePath, mimeType) {
 // Main video route
 // -------------------------
 app.get("/video/:fileId", async (req, res) => {
-    try {
-      const { fileId } = req.params;
-      const { size, mimeType, name } = await getFileMetadata(fileId);
-      const localPath = path.join(os.tmpdir(), name);
-  
-      if (size > 100 * 1024 * 1024) {
-        // Large file: download to temp
-        if (lastTempFile && lastTempFile !== localPath && fs.existsSync(lastTempFile)) {
-          fs.unlink(lastTempFile, (err) => {
-            if (err) console.error("Failed to delete previous temp file:", err);
-            else console.log("Deleted previous temp file:", lastTempFile);
-          });
-        }
-  
-        if (!fs.existsSync(localPath)) {
-          console.log("Downloading large file to temp directory...");
-          await downloadFile(fileId, localPath);
-          console.log("Download complete.");
-        }
-  
-        lastTempFile = localPath;
-        return streamFile(req, res, localPath, mimeType);
-  
-      } else {
-        // Small file: stream directly from Drive
-        const videoUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
-        const headers = req.headers.range ? { Range: req.headers.range } : {};
-        const videoRes = await fetch(videoUrl, { headers });
-  
-        res.writeHead(videoRes.status, {
-          "Content-Type": mimeType,
-          ...Object.fromEntries(videoRes.headers.entries()),
+  try {
+    const { fileId } = req.params;
+    const { size, mimeType, name } = await getFileMetadata(fileId);
+    const localPath = path.join(os.tmpdir(), name);
+
+    if (size > 100 * 1024 * 1024) {
+      // Large file: download to temp
+      if (lastTempFile && lastTempFile !== localPath && fs.existsSync(lastTempFile)) {
+        fs.unlink(lastTempFile, (err) => {
+          if (err) console.error("Failed to delete previous temp file:", err);
+          else console.log("Deleted previous temp file:", lastTempFile);
         });
-  
-        return videoRes.body.pipe(res);
       }
-  
-    } catch (err) {
-      console.error(err);
-      res.status(500).send("❌ " + err.message);
+
+      if (!fs.existsSync(localPath)) {
+        console.log("Downloading large file to temp directory...");
+        await downloadFile(fileId, localPath);
+        console.log("Download complete.");
+      }
+
+      lastTempFile = localPath;
+      return streamFile(req, res, localPath, mimeType);
+    } else {
+      // Small file: stream directly from Drive
+      const videoUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
+      const headers = req.headers.range ? { Range: req.headers.range } : {};
+      const videoRes = await fetch(videoUrl, { headers });
+
+      res.writeHead(videoRes.status, {
+        "Content-Type": mimeType,
+        ...Object.fromEntries(videoRes.headers.entries()),
+      });
+
+      return videoRes.body.pipe(res);
     }
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("❌ " + err.message);
+  }
 });
-  
+
+// -------------------------
+// ✅ NEW: Trim video route
+// -------------------------
+app.post("/trim", async (req, res) => {
+  const { fileId, start, end, preview } = req.body;
+  if (!fileId || !start || !end)
+    return res.status(400).send("Missing parameters.");
+
+  try {
+    const { name } = await getFileMetadata(fileId);
+    const srcPath = path.join(os.tmpdir(), name);
+
+    // Download if not already cached
+    if (!fs.existsSync(srcPath)) {
+      console.log("Downloading source file for trimming...");
+      await downloadFile(fileId, srcPath);
+    }
+
+    const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
+    const cmd = `ffmpeg -ss ${start} -to ${end} -i "${srcPath}" -c copy "${outPath}" -y`;
+    console.log("Running:", cmd);
+    await execPromise(cmd);
+
+    if (preview) {
+      const buffer = fs.readFileSync(outPath);
+      res.setHeader("Content-Type", "video/mp4");
+      res.send(buffer);
+      fs.unlink(outPath, () => {});
+    } else {
+      res.download(outPath, "trimmed_video.mp4", () => fs.unlink(outPath, () => {}));
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("❌ Failed to trim video: " + err.message);
+  }
+});
+
+// ✅ Also support GET version for direct downloads
+app.get("/trim", async (req, res) => {
+  const { fileId, start, end } = req.query;
+  if (!fileId || !start || !end)
+    return res.status(400).send("Missing parameters.");
+
+  try {
+    const { name } = await getFileMetadata(fileId);
+    const srcPath = path.join(os.tmpdir(), name);
+
+    if (!fs.existsSync(srcPath)) {
+      console.log("Downloading file for trim...");
+      await downloadFile(fileId, srcPath);
+    }
+
+    const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
+    const cmd = `ffmpeg -ss ${start} -to ${end} -i "${srcPath}" -c copy "${outPath}" -y`;
+    console.log("Running:", cmd);
+    await execPromise(cmd);
+
+    res.download(outPath, "trimmed_video.mp4", () => fs.unlink(outPath, () => {}));
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("❌ Failed to trim video: " + err.message);
+  }
+});
 
 app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));
