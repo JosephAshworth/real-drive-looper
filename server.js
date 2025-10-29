@@ -24,6 +24,40 @@ app.use(express.json()); // ✅ Added for JSON parsing (needed for POST /trim)
 // Track last downloaded temp file
 let lastTempFile = null;
 
+
+// -------------------------
+// Helper: normalize times (supports seconds or milliseconds)
+// -------------------------
+function normalizeTimes({ start, end, startMs, endMs }) {
+  const s =
+    start !== undefined
+      ? parseFloat(start)
+      : startMs !== undefined
+      ? parseFloat(startMs) / 1000
+      : NaN;
+
+  const e =
+    end !== undefined
+      ? parseFloat(end)
+      : endMs !== undefined
+      ? parseFloat(endMs) / 1000
+      : NaN;
+
+  if (!Number.isFinite(s) || !Number.isFinite(e)) {
+    throw new Error("Invalid start/end time.");
+  }
+  if (e <= s) throw new Error("End time must be after start time.");
+
+  const startSec = +s.toFixed(3);
+  const endSec = +e.toFixed(3);
+  const duration = +(endSec - startSec).toFixed(3);
+
+  // Force precise re-encode whenever ms are used
+  const forcePrecise = startMs !== undefined || endMs !== undefined;
+  return { startSec, duration, forcePrecise };
+}
+
+
 // -------------------------
 // Automatic cleanup of old temp videos
 // -------------------------
@@ -159,12 +193,11 @@ app.get("/video/:fileId", async (req, res) => {
 });
 
 // -------------------------
-// ✅ NEW: Trim video route
+// ✅ Trim video route (ms-accurate when ms provided)
 // -------------------------
 app.post("/trim", async (req, res) => {
-  const { fileId, start, end, preview } = req.body;
-  if (!fileId || !start || !end)
-    return res.status(400).send("Missing parameters.");
+  const { fileId, start, end, startMs, endMs, preview, mode } = req.body; // mode: "precise"|"copy" (optional)
+  if (!fileId) return res.status(400).send("Missing fileId.");
 
   try {
     const { name } = await getFileMetadata(fileId);
@@ -176,8 +209,17 @@ app.post("/trim", async (req, res) => {
       await downloadFile(fileId, srcPath);
     }
 
+    const { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
+
+    const precise = forcePrecise || mode === "precise"; // auto-precise if ms given
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
-    const cmd = `ffmpeg -ss ${start} -to ${end} -i "${srcPath}" -c copy "${outPath}" -y`;
+
+    const cmd = precise
+      // Accurate seek (ms/frame precise): -ss AFTER -i + -t, with re-encode
+      ? `ffmpeg -i "${srcPath}" -ss ${startSec} -t ${duration} -map 0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k -movflags +faststart -pix_fmt yuv420p -y "${outPath}"`
+      // Fast (keyframe-limited) copy
+      : `ffmpeg -ss ${startSec} -t ${duration} -i "${srcPath}" -map 0 -c copy -movflags +faststart -y "${outPath}"`;
+
     console.log("Running:", cmd);
     await execPromise(cmd);
 
@@ -195,11 +237,11 @@ app.post("/trim", async (req, res) => {
   }
 });
 
-// ✅ Also support GET version for direct downloads
+
+// ✅ GET version (supports ms via startMs/endMs)
 app.get("/trim", async (req, res) => {
-  const { fileId, start, end } = req.query;
-  if (!fileId || !start || !end)
-    return res.status(400).send("Missing parameters.");
+  const { fileId, start, end, startMs, endMs, mode } = req.query; // mode optional
+  if (!fileId) return res.status(400).send("Missing fileId.");
 
   try {
     const { name } = await getFileMetadata(fileId);
@@ -210,8 +252,15 @@ app.get("/trim", async (req, res) => {
       await downloadFile(fileId, srcPath);
     }
 
+    const { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
+
+    const precise = forcePrecise || mode === "precise";
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
-    const cmd = `ffmpeg -ss ${start} -to ${end} -i "${srcPath}" -c copy "${outPath}" -y`;
+
+    const cmd = precise
+      ? `ffmpeg -i "${srcPath}" -ss ${startSec} -t ${duration} -map 0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k -movflags +faststart -pix_fmt yuv420p -y "${outPath}"`
+      : `ffmpeg -ss ${startSec} -t ${duration} -i "${srcPath}" -map 0 -c copy -movflags +faststart -y "${outPath}"`;
+
     console.log("Running:", cmd);
     await execPromise(cmd);
 
@@ -221,5 +270,6 @@ app.get("/trim", async (req, res) => {
     res.status(500).send("❌ Failed to trim video: " + err.message);
   }
 });
+
 
 app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));

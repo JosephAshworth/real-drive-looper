@@ -67,18 +67,21 @@
     <label>Start Time:</label><br>
     <input type="number" id="startHours" min="0" max="23" value="0" style="width:60px;"> :
     <input type="number" id="startMinutes" min="0" max="59" value="0" style="width:60px;"> :
-    <input type="number" id="startSeconds" min="0" max="59" value="0" style="width:60px;">
+    <input type="number" id="startSeconds" min="0" max="59" value="0" style="width:60px;"> .
+    <input type="number" id="startMillis"  min="0" max="999" value="0" style="width:80px;" placeholder="ms">
   
     <br><br>
     <label>End Time:</label><br>
     <input type="number" id="endHours" min="0" max="23" value="0" style="width:60px;"> :
     <input type="number" id="endMinutes" min="0" max="59" value="0" style="width:60px;"> :
-    <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;">
+    <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;"> .
+    <input type="number" id="endMillis"  min="0" max="999" value="0" style="width:80px;" placeholder="ms">
   
     <br><br>
     <button onclick="previewTrim()">Preview Trim</button>
     <button onclick="downloadTrim()">Download Trim</button>
   </div>
+  
   
   
   
@@ -164,15 +167,18 @@
       let val = parseInt(el.value, 10);
       if (isNaN(val) || val < 0) val = 0;
       if (val > max) val = max;
-      el.value = val; // ✅ always correct visually too
+      el.value = val; // keep UI in sync
       return val;
     }
 
+    // Returns both total seconds (float) and total milliseconds (int)
     function formatTimeFromInputs(prefix) {
-      const h = sanitizeInput(prefix + "Hours", 23);
-      const m = sanitizeInput(prefix + "Minutes", 59);
-      const s = sanitizeInput(prefix + "Seconds", 59);
-      return h * 3600 + m * 60 + s;
+      const h  = sanitizeInput(prefix + "Hours", 23);
+      const m  = sanitizeInput(prefix + "Minutes", 59);
+      const s  = sanitizeInput(prefix + "Seconds", 59);
+      const ms = sanitizeInput(prefix + "Millis",  999);
+      const totalMs = (h * 3600 + m * 60 + s) * 1000 + ms;
+      return { seconds: totalMs / 1000, ms: totalMs };
     }
 
     async function previewTrim() {
@@ -184,10 +190,10 @@
         return;
       }
 
-      const start = formatTimeFromInputs("start");
-      const end = formatTimeFromInputs("end");
+      const startT = formatTimeFromInputs("start");
+      const endT   = formatTimeFromInputs("end");
 
-      if (end <= start) {
+      if (endT.ms <= startT.ms) {
         error.textContent = "⚠️ End time must be after start time.";
         return;
       }
@@ -199,7 +205,13 @@
         const res = await fetch("/trim", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileId: currentFileId, start, end, preview: true })
+          body: JSON.stringify({
+            fileId: currentFileId,
+            startMs: startT.ms,
+            endMs: endT.ms,
+            mode: "precise",   // <-- force accurate re-encode
+            preview: true
+          })
         });
 
         if (!res.ok) throw new Error("Trim failed");
@@ -227,20 +239,22 @@
         return;
       }
 
-      const start = formatTimeFromInputs("start");
-      const end = formatTimeFromInputs("end");
+      const startT = formatTimeFromInputs("start");
+      const endT   = formatTimeFromInputs("end");
 
-      if (end <= start) {
+      if (endT.ms <= startT.ms) {
         error.textContent = "⚠️ End time must be after start time.";
         return;
       }
 
-      window.location.href = `/trim?fileId=${currentFileId}&start=${start}&end=${end}`;
+      // Use milliseconds + precise mode
+      const url = `/trim?fileId=${currentFileId}&startMs=${startT.ms}&endMs=${endT.ms}&mode=precise`;
+      window.location.href = url;
     }
 
 
 
-    // 🔧 Auto-correct time inputs live as the user types
+    // 🔧 Auto-correct time inputs live as the user types (now includes ms)
     function clampValue(input, max) {
       let val = parseInt(input.value, 10);
       if (isNaN(val) || val < 0) val = 0;
@@ -248,10 +262,11 @@
       input.value = val;
     }
 
-    // Apply live clamping to all hour/min/sec inputs
-    ["startHours","startMinutes","startSeconds","endHours","endMinutes","endSeconds"].forEach(id => {
+    // Apply live clamping to all hour/min/sec/ms inputs
+    ["startHours","startMinutes","startSeconds","startMillis",
+    "endHours","endMinutes","endSeconds","endMillis"].forEach(id => {
       const el = document.getElementById(id);
-      const max = id.includes("Hours") ? 23 : 59;
+      const max = id.includes("Hours") ? 23 : id.includes("Millis") ? 999 : 59;
       el.addEventListener("input", () => clampValue(el, max));
     });
 
