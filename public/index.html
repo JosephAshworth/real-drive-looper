@@ -181,6 +181,29 @@
       return { seconds: totalMs / 1000, ms: totalMs };
     }
 
+    // Build /trim query: only send ms (and precise mode) when ms are non-zero
+    function buildTrimQuery(fileId, startT, endT, { preview = false } = {}) {
+      const params = new URLSearchParams({ fileId });
+
+      const msNonZero = (startT.ms % 1000 !== 0) || (endT.ms % 1000 !== 0);
+
+      if (msNonZero) {
+        params.set("startMs", String(startT.ms));
+        params.set("endMs", String(endT.ms));
+        // server will auto precise when ms are sent, but we can be explicit:
+        params.set("mode", "precise");
+      } else {
+        // whole seconds -> keep copy mode (fast, low RAM)
+        params.set("start", String(Math.floor(startT.seconds)));
+        params.set("end",   String(Math.floor(endT.seconds)));
+        // do NOT set mode=precise
+      }
+
+      if (preview) params.set("preview", "1");
+      return `/trim?${params.toString()}`;
+    }
+
+
     async function previewTrim() {
       const error = document.getElementById("error");
       error.textContent = "";
@@ -201,34 +224,24 @@
       const container = document.getElementById("videoContainer");
       container.innerHTML = "⏳ Trimming preview...";
 
-      try {
-        const res = await fetch("/trim", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            fileId: currentFileId,
-            startMs: startT.ms,
-            endMs: endT.ms,
-            mode: "precise",   // <-- force accurate re-encode
-            preview: true
-          })
-        });
+      // ✅ Let the browser STREAM the preview directly (no fetch blob in memory)
+      const src = buildTrimQuery(currentFileId, startT, endT, { preview: true });
 
-        if (!res.ok) throw new Error("Trim failed");
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
+      container.innerHTML = `
+        <video controls autoplay muted style="width:100%;border-radius:10px;">
+          <source src="${src}" type="video/mp4">
+        </video>
+      `;
 
-        container.innerHTML = `
-          <video controls autoplay style="width:100%;border-radius:10px;">
-            <source src="${url}" type="video/mp4">
-          </video>
-        `;
-        error.textContent = "";
-      } catch (err) {
-        container.innerHTML = "";
-        error.textContent = "❌ " + err.message;
-      }
+      // unmute on first user gesture
+      const video = container.querySelector("video");
+      document.addEventListener("click", function enable() {
+        video.muted = false;
+        video.play().catch(()=>{});
+        document.removeEventListener("click", enable);
+      });
     }
+
 
     function downloadTrim() {
       const error = document.getElementById("error");
@@ -247,10 +260,11 @@
         return;
       }
 
-      // Use milliseconds + precise mode
-      const url = `/trim?fileId=${currentFileId}&startMs=${startT.ms}&endMs=${endT.ms}&mode=precise`;
-      window.location.href = url;
+      // ✅ Only send ms (and precise mode) if ms are actually non-zero
+      const url = buildTrimQuery(currentFileId, startT, endT, { preview: false });
+      window.location.href = url; // browser will download the streamed file
     }
+
 
 
 

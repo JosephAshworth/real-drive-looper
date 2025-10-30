@@ -6,6 +6,9 @@ import path from "path";
 import os from "node:os";
 import { exec } from "child_process";
 import util from "util";  // ✅ Added for promisified exec
+import ffmpegPath from "ffmpeg-static";
+import { spawn } from "child_process";
+
 
 dotenv.config();
 const app = express();
@@ -25,21 +28,109 @@ app.use(express.json()); // ✅ Added for JSON parsing (needed for POST /trim)
 let lastTempFile = null;
 
 
+// Small concurrency gate (avoid 2 encodes at once on small plans)
+let inFlight = 0;
+const MAX_JOBS = 1;
+async function gate() {
+  while (inFlight >= MAX_JOBS) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+  inFlight++;
+  return () => { inFlight--; };
+}
+
+function spawnFfmpeg(args) {
+  const bin = process.env.FFMPEG_PATH || ffmpegPath;
+  return spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+}
+
+// Stream a finished file to client (no readFileSync) and unlink afterwards
+function streamAndUnlink(filePath, res, { inline = false, filename = "trimmed_video.mp4" } = {}) {
+  const headers = { "Content-Type": "video/mp4" };
+  if (!inline) headers["Content-Disposition"] = `attachment; filename="${filename}"`;
+  res.writeHead(200, headers);
+  const read = fs.createReadStream(filePath);
+  read.pipe(res);
+  const cleanup = () => fs.unlink(filePath, () => {});
+  read.on("close", cleanup);
+  read.on("error", (e) => { console.error("Stream error:", e); cleanup(); try { res.end(); } catch {} });
+  res.on("close", cleanup);
+}
+
+// For previews: pipe ffmpeg -> client directly (lowest RAM)
+function pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQuality = true }, res) {
+  const args = precise
+    ? [
+        "-nostdin",
+        "-i", srcPath,
+        "-ss", String(startSec),
+        "-t",  String(duration),
+        "-map", "0",
+        "-c:v", "libx264",
+        "-preset", previewQuality ? "ultrafast" : "veryfast",
+        "-crf",   previewQuality ? "26" : "20",
+        "-c:a", "aac", "-b:a", previewQuality ? "96k" : "192k",
+        "-threads", "1",
+        "-movflags", "frag_keyframe+empty_moov+faststart",
+        "-pix_fmt", "yuv420p",
+        "-f", "mp4", "-"
+      ]
+    : [
+        "-nostdin",
+        "-ss", String(startSec),
+        "-t",  String(duration),
+        "-i", srcPath,
+        "-map", "0",
+        "-c", "copy",
+        "-threads", "1",
+        "-movflags", "frag_keyframe+empty_moov+faststart",
+        "-f", "mp4", "-"
+      ];
+
+  const ff = spawnFfmpeg(args);
+
+  res.writeHead(200, {
+    "Content-Type": "video/mp4",
+    "Transfer-Encoding": "chunked",
+    "Cache-Control": "no-store"
+  });
+
+  let err = "";
+  ff.stdout.pipe(res);
+  ff.stderr.on("data", d => (err += d.toString()));
+  ff.on("close", (code) => {
+    if (code !== 0) {
+      console.error("ffmpeg failed:", err || `code ${code}`);
+      if (!res.headersSent) res.status(500).send("ffmpeg error");
+      else try { res.end(); } catch {}
+      return;
+    }
+    try { res.end(); } catch {}
+  });
+
+  // If client disconnects, kill ffmpeg
+  res.on("close", () => { try { ff.kill("SIGKILL"); } catch {} });
+}
+
+
+
 // -------------------------
 // Helper: normalize times (supports seconds or milliseconds)
+// - Re-encode ONLY if:
+//   * ms are actually non-zero, OR
+//   * seconds include fractional part
 // -------------------------
 function normalizeTimes({ start, end, startMs, endMs }) {
-  const s =
-    start !== undefined
-      ? parseFloat(start)
-      : startMs !== undefined
+  // parse seconds or ms->s
+  const s = (start !== undefined && start !== null)
+    ? parseFloat(start)
+    : (startMs !== undefined && startMs !== null)
       ? parseFloat(startMs) / 1000
       : NaN;
 
-  const e =
-    end !== undefined
-      ? parseFloat(end)
-      : endMs !== undefined
+  const e = (end !== undefined && end !== null)
+    ? parseFloat(end)
+    : (endMs !== undefined && endMs !== null)
       ? parseFloat(endMs) / 1000
       : NaN;
 
@@ -48,14 +139,27 @@ function normalizeTimes({ start, end, startMs, endMs }) {
   }
   if (e <= s) throw new Error("End time must be after start time.");
 
+  // round to ms precision for ffmpeg
   const startSec = +s.toFixed(3);
-  const endSec = +e.toFixed(3);
+  const endSec   = +e.toFixed(3);
   const duration = +(endSec - startSec).toFixed(3);
 
-  // Force precise re-encode whenever ms are used
-  const forcePrecise = startMs !== undefined || endMs !== undefined;
+  // detect if ms actually matter (non-zero)
+  const sm = (startMs !== undefined && startMs !== null) ? parseInt(startMs, 10) : null;
+  const em = (endMs   !== undefined && endMs   !== null) ? parseInt(endMs,   10) : null;
+  const msNonZero =
+    (sm !== null && (sm % 1000) !== 0) ||
+    (em !== null && (em % 1000) !== 0);
+
+  // also re-encode if seconds include fractional part
+  const hasFraction = (startSec % 1 !== 0) || (endSec % 1 !== 0);
+
+  // ✅ only force precise when needed
+  const forcePrecise = msNonZero || hasFraction;
+
   return { startSec, duration, forcePrecise };
 }
+
 
 
 // -------------------------
@@ -199,50 +303,79 @@ app.post("/trim", async (req, res) => {
   const { fileId, start, end, startMs, endMs, preview, mode } = req.body; // mode: "precise"|"copy" (optional)
   if (!fileId) return res.status(400).send("Missing fileId.");
 
+  const release = await gate(); // limit concurrent encodes
   try {
     const { name } = await getFileMetadata(fileId);
     const srcPath = path.join(os.tmpdir(), name);
 
-    // Download if not already cached
     if (!fs.existsSync(srcPath)) {
       console.log("Downloading source file for trimming...");
       await downloadFile(fileId, srcPath);
     }
 
     const { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
+    const precise = forcePrecise || mode === "precise"; // only re-encode when needed/forced
 
-    const precise = forcePrecise || mode === "precise"; // auto-precise if ms given
-    const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
-
-    const cmd = precise
-      // Accurate seek (ms/frame precise): -ss AFTER -i + -t, with re-encode
-      ? `ffmpeg -i "${srcPath}" -ss ${startSec} -t ${duration} -map 0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k -movflags +faststart -pix_fmt yuv420p -y "${outPath}"`
-      // Fast (keyframe-limited) copy
-      : `ffmpeg -ss ${startSec} -t ${duration} -i "${srcPath}" -map 0 -c copy -movflags +faststart -y "${outPath}"`;
-
-    console.log("Running:", cmd);
-    await execPromise(cmd);
-
+    // ✅ PREVIEW: stream directly from ffmpeg (no temp file, no RAM spike)
     if (preview) {
-      const buffer = fs.readFileSync(outPath);
-      res.setHeader("Content-Type", "video/mp4");
-      res.send(buffer);
-      fs.unlink(outPath, () => {});
-    } else {
-      res.download(outPath, "trimmed_video.mp4", () => fs.unlink(outPath, () => {}));
+      pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQuality: true }, res);
+      return;
     }
+
+    // ✅ DOWNLOAD: write to /tmp, then stream file (no readFileSync)
+    const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
+    const args = precise
+      ? [
+          "-nostdin",
+          "-i", srcPath,
+          "-ss", String(startSec),
+          "-t",  String(duration),
+          "-map", "0",
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+          "-c:a", "aac", "-b:a", "192k",
+          "-threads", "1",
+          "-movflags", "+faststart",
+          "-pix_fmt", "yuv420p",
+          "-y", outPath
+        ]
+      : [
+          "-nostdin",
+          "-ss", String(startSec),
+          "-t",  String(duration),
+          "-i", srcPath,
+          "-map", "0",
+          "-c", "copy",
+          "-threads", "1",
+          "-movflags", "+faststart",
+          "-y", outPath
+        ];
+
+    console.log("ffmpeg", args.join(" "));
+    await new Promise((resolve, reject) => {
+      const ff = spawnFfmpeg(args);
+      let err = "";
+      ff.stderr.on("data", d => (err += d.toString()));
+      ff.on("close", code => (code === 0 ? resolve() : reject(new Error(err || `code ${code}`))));
+    });
+
+    // Stream file to client and unlink afterwards
+    streamAndUnlink(outPath, res, { inline: false, filename: "trimmed_video.mp4" });
   } catch (err) {
     console.error(err);
     res.status(500).send("❌ Failed to trim video: " + err.message);
+  } finally {
+    release();
   }
 });
 
 
+
 // ✅ GET version (supports ms via startMs/endMs)
 app.get("/trim", async (req, res) => {
-  const { fileId, start, end, startMs, endMs, mode } = req.query; // mode optional
+  const { fileId, start, end, startMs, endMs, mode } = req.query;
   if (!fileId) return res.status(400).send("Missing fileId.");
 
+  const release = await gate(); // limit concurrent encodes
   try {
     const { name } = await getFileMetadata(fileId);
     const srcPath = path.join(os.tmpdir(), name);
@@ -253,23 +386,53 @@ app.get("/trim", async (req, res) => {
     }
 
     const { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
-
     const precise = forcePrecise || mode === "precise";
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
 
-    const cmd = precise
-      ? `ffmpeg -i "${srcPath}" -ss ${startSec} -t ${duration} -map 0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 192k -movflags +faststart -pix_fmt yuv420p -y "${outPath}"`
-      : `ffmpeg -ss ${startSec} -t ${duration} -i "${srcPath}" -map 0 -c copy -movflags +faststart -y "${outPath}"`;
+    const args = precise
+      ? [
+          "-nostdin",
+          "-i", srcPath,
+          "-ss", String(startSec),
+          "-t",  String(duration),
+          "-map", "0",
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+          "-c:a", "aac", "-b:a", "192k",
+          "-threads", "1",
+          "-movflags", "+faststart",
+          "-pix_fmt", "yuv420p",
+          "-y", outPath
+        ]
+      : [
+          "-nostdin",
+          "-ss", String(startSec),
+          "-t",  String(duration),
+          "-i", srcPath,
+          "-map", "0",
+          "-c", "copy",
+          "-threads", "1",
+          "-movflags", "+faststart",
+          "-y", outPath
+        ];
 
-    console.log("Running:", cmd);
-    await execPromise(cmd);
+    console.log("ffmpeg", args.join(" "));
+    await new Promise((resolve, reject) => {
+      const ff = spawnFfmpeg(args);
+      let err = "";
+      ff.stderr.on("data", d => (err += d.toString()));
+      ff.on("close", code => (code === 0 ? resolve() : reject(new Error(err || `code ${code}`))));
+    });
 
-    res.download(outPath, "trimmed_video.mp4", () => fs.unlink(outPath, () => {}));
+    // Stream file to client and unlink afterwards
+    streamAndUnlink(outPath, res, { inline: false, filename: "trimmed_video.mp4" });
   } catch (err) {
     console.error(err);
     res.status(500).send("❌ Failed to trim video: " + err.message);
+  } finally {
+    release();
   }
 });
+
 
 
 app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));
