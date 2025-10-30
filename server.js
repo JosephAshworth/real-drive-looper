@@ -57,6 +57,31 @@ function streamAndUnlink(filePath, res, { inline = false, filename = "trimmed_vi
   res.on("close", cleanup);
 }
 
+
+// --- Preview cache & route (seekable previews) ---
+const previews = new Map();
+
+function makeId() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function schedulePreviewCleanup(id, filePath, ms = 10 * 60 * 1000) {
+  setTimeout(() => {
+    previews.delete(id);
+    fs.unlink(filePath, () => {});
+  }, ms);
+}
+
+// Serve preview files with Range (so timeline is scrubbable)
+app.get("/preview/:id", (req, res) => {
+  const filePath = previews.get(req.params.id);
+  if (!filePath || !fs.existsSync(filePath)) {
+    return res.status(404).send("Preview not found or expired.");
+  }
+  streamFile(req, res, filePath, "video/mp4");
+});
+
+
 // For previews: pipe ffmpeg -> client directly (lowest RAM)
 function pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQuality = true }, res) {
   const args = precise
@@ -316,11 +341,53 @@ app.post("/trim", async (req, res) => {
     const { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
     const precise = forcePrecise || mode === "precise"; // only re-encode when needed/forced
 
-    // ✅ PREVIEW: stream directly from ffmpeg (no temp file, no RAM spike)
+    // ✅ PREVIEW: write a small file to /tmp (faststart) and return a seekable URL
     if (preview) {
-      pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQuality: true }, res);
-      return;
+      const outPath = path.join(os.tmpdir(), `preview_${Date.now()}.mp4`);
+      const args = precise
+        ? [
+            "-nostdin",
+            "-i", srcPath,
+            "-ss", String(startSec),
+            "-t",  String(duration),
+            "-map", "0",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+            "-c:a", "aac", "-b:a", "96k",
+            "-threads", "1",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            "-y", outPath
+          ]
+        : [
+            "-nostdin",
+            "-ss", String(startSec),
+            "-t",  String(duration),
+            "-i", srcPath,
+            "-map", "0",
+            "-c", "copy",
+            "-threads", "1",
+            "-movflags", "+faststart",
+            "-y", outPath
+          ];
+
+      console.log("ffmpeg (preview)", args.join(" "));
+      await new Promise((resolve, reject) => {
+        const ff = spawnFfmpeg(args);
+        let err = "";
+        ff.stderr.on("data", d => (err += d.toString()));
+        ff.on("close", code => (code === 0 ? resolve() : reject(new Error(err || `code ${code}`))));
+      });
+
+      const id = makeId();
+      previews.set(id, outPath);
+      schedulePreviewCleanup(id, outPath); // auto-clean in ~10 min
+
+      // after generating the file and id
+      res.type("application/json");
+      return res.json({ url: `/preview/${id}` });
+
     }
+
 
     // ✅ DOWNLOAD: write to /tmp, then stream file (no readFileSync)
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);

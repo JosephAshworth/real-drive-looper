@@ -224,23 +224,62 @@
       const container = document.getElementById("videoContainer");
       container.innerHTML = "⏳ Trimming preview...";
 
-      // ✅ Let the browser STREAM the preview directly (no fetch blob in memory)
-      const src = buildTrimQuery(currentFileId, startT, endT, { preview: true });
+      // Only send ms/precise when milliseconds are non-zero
+      const msNonZero = (startT.ms % 1000 !== 0) || (endT.ms % 1000 !== 0);
+      const body = { fileId: currentFileId, preview: true };
 
-      container.innerHTML = `
-        <video controls autoplay muted style="width:100%;border-radius:10px;">
-          <source src="${src}" type="video/mp4">
-        </video>
-      `;
+      if (msNonZero) {
+        body.startMs = startT.ms;
+        body.endMs   = endT.ms;
+        body.mode    = "precise";
+      } else {
+        body.start = Math.floor(startT.seconds);
+        body.end   = Math.floor(endT.seconds);
+      }
 
-      // unmute on first user gesture
-      const video = container.querySelector("video");
-      document.addEventListener("click", function enable() {
-        video.muted = false;
-        video.play().catch(()=>{});
-        document.removeEventListener("click", enable);
-      });
+      try {
+        const res = await fetch("/trim", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify(body)
+        });
+
+        if (!res.ok) throw new Error("Trim failed");
+
+        const ct = res.headers.get("content-type") || "";
+        let videoSrc;
+
+        if (ct.includes("application/json")) {
+          // Expected path: server returns { url: "/preview/<id>" }
+          const { url } = await res.json();
+          videoSrc = url; // served with Range -> scrubbable
+        } else {
+          // Fallback in case server sent an MP4 body (older code path)
+          const blob = await res.blob();
+          videoSrc = URL.createObjectURL(blob); // scrubbable via local blob URL
+        }
+
+        container.innerHTML = `
+          <video controls autoplay loop playsinline style="width:100%;border-radius:10px;">
+            <source src="${videoSrc}" type="video/mp4">
+          </video>
+        `;
+
+        // unmute on first user gesture (mobile autoplay policy)
+        const video = container.querySelector("video");
+        document.addEventListener("click", function enable() {
+          video.muted = false;
+          video.play().catch(()=>{});
+          document.removeEventListener("click", enable);
+        });
+      } catch (err) {
+        container.innerHTML = "";
+        error.textContent = "❌ " + err.message;
+      }
     }
+
+
 
 
     function downloadTrim() {
