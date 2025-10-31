@@ -4,16 +4,16 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 import os from "node:os";
-import { exec } from "child_process";
-import util from "util";
 import ffmpegPath from "ffmpeg-static";
 import { spawn } from "child_process";
+import crypto from "node:crypto";
+
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY;
-const execPromise = util.promisify(exec);
+//const execPromise = util.promisify(exec);
 
 if (!API_KEY) {
   console.error("❌ Missing GOOGLE_API_KEY in .env file");
@@ -23,8 +23,55 @@ if (!API_KEY) {
 app.use(express.static("public"));
 app.use(express.json());
 
-// Track last downloaded temp file
-let lastTempFile = null;
+// App-scoped tmp root and per-session helpers
+const TMP_ROOT = path.join(os.tmpdir(), "looper");
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+
+// Track last downloaded temp file PER session
+const lastTempBySid = new Map(); // sid -> absolute path
+
+function parseCookies(req) {
+  const raw = req.headers.cookie || "";
+  const out = {};
+  raw.split(";").forEach(p => {
+    const i = p.indexOf("=");
+    if (i > -1) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
+  });
+  return out;
+}
+
+function getOrSetSid(req, res) {
+  const cookies = parseCookies(req);
+  let sid = cookies.sid;
+  if (!sid || !/^[a-zA-Z0-9_-]{16,}$/.test(sid)) {
+    sid = crypto.randomBytes(12).toString("base64url");
+    const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+    res.setHeader("Set-Cookie", `sid=${sid}; Path=/; HttpOnly; SameSite=Lax${secure}`);
+  }
+  return sid;
+}
+
+function touchDir(dir) {
+  try {
+    const now = new Date();
+    fs.utimesSync(dir, now, now);
+  } catch {}
+}
+
+function sessionDir(req, res) {
+  const sid = getOrSetSid(req, res);
+  const dir = path.join(TMP_ROOT, sid);
+  fs.mkdirSync(dir, { recursive: true });
+  touchDir(dir);
+  return { sid, dir };
+}
+
+// Safe basename: prefix with fileId and sanitize original name
+function safeBaseName(fileId, name = "file.mp4") {
+  const base = path.basename(name).replace(/[^\w.\- ]+/g, "_").slice(0, 80) || "file";
+  return `${fileId}__${base}`;
+}
+
 
 // Small concurrency gate (avoid 2 encodes at once on small plans)
 let inFlight = 0;
@@ -84,7 +131,7 @@ function streamAndUnlink(filePath, res, { inline = false, filename = "trimmed_vi
 }
 
 // --- Preview cache & route (seekable previews) ---
-const previews = new Map();
+const previews = new Map(); // id -> { path, sid }
 
 function makeId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -127,106 +174,110 @@ function streamFile(req, res, filePath, mimeType) {
 
 // Serve preview files with Range (so timeline is scrubbable) + cache headers
 app.get("/preview/:id", (req, res) => {
-  const filePath = previews.get(req.params.id);
-  if (!filePath || !fs.existsSync(filePath)) {
+  const { sid } = sessionDir(req, res); // ensure session
+  const meta = previews.get(req.params.id);
+  if (!meta || !fs.existsSync(meta.path)) {
     return res.status(404).send("Preview not found or expired.");
+  }
+  if (meta.sid !== sid) {
+    return res.status(403).send("Forbidden");
   }
   res.setHeader("Accept-Ranges", "bytes");
   res.setHeader("Cache-Control", "public, max-age=600");
-  streamFile(req, res, filePath, "video/mp4");
+  streamFile(req, res, meta.path, "video/mp4");
 });
 
-// For piping previews: fragmented mp4 to allow instant playback & scrubbing
-function pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQuality = true }, res) {
-  const args = precise
-    ? [
-        "-nostdin",
-        "-i",
-        srcPath,
-        "-ss",
-        String(startSec),
-        "-t",
-        String(duration),
-        "-map",
-        "0",
-        "-c:v",
-        "libx264",
-        "-preset",
-        previewQuality ? "ultrafast" : "veryfast",
-        "-tune",
-        "zerolatency",
-        "-crf",
-        previewQuality ? "30" : "20",
-        "-c:a",
-        "aac",
-        "-b:a",
-        previewQuality ? "96k" : "192k",
-        "-threads",
-        "1",
-        "-movflags",
-        "frag_keyframe+empty_moov",
-        "-pix_fmt",
-        "yuv420p",
-        "-f",
-        "mp4",
-        "-",
-      ]
-    : [
-        "-nostdin",
-        "-ss",
-        String(startSec),
-        "-t",
-        String(duration),
-        "-i",
-        srcPath,
-        "-map",
-        "0",
-        "-c",
-        "copy",
-        "-fflags",
-        "+genpts",
-        "-avoid_negative_ts",
-        "make_zero",
-        "-threads",
-        "1",
-        "-movflags",
-        "frag_keyframe+empty_moov",
-        "-f",
-        "mp4",
-        "-",
-      ];
+// // For piping previews: fragmented mp4 to allow instant playback & scrubbing
+// function pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQuality = true }, res) {
+//   const args = precise
+//     ? [
+//         "-nostdin",
+//         "-i",
+//         srcPath,
+//         "-ss",
+//         String(startSec),
+//         "-t",
+//         String(duration),
+//         "-map",
+//         "0",
+//         "-c:v",
+//         "libx264",
+//         "-preset",
+//         previewQuality ? "ultrafast" : "veryfast",
+//         "-tune",
+//         "zerolatency",
+//         "-crf",
+//         previewQuality ? "30" : "20",
+//         "-c:a",
+//         "aac",
+//         "-b:a",
+//         previewQuality ? "96k" : "192k",
+//         "-threads",
+//         "1",
+//         "-movflags",
+//         "frag_keyframe+empty_moov",
+//         "-pix_fmt",
+//         "yuv420p",
+//         "-f",
+//         "mp4",
+//         "-",
+//       ]
+//     : [
+//         "-nostdin",
+//         "-ss",
+//         String(startSec),
+//         "-t",
+//         String(duration),
+//         "-i",
+//         srcPath,
+//         "-map",
+//         "0",
+//         "-c",
+//         "copy",
+//         "-fflags",
+//         "+genpts",
+//         "-avoid_negative_ts",
+//         "make_zero",
+//         "-threads",
+//         "1",
+//         "-movflags",
+//         "frag_keyframe+empty_moov",
+//         "-f",
+//         "mp4",
+//         "-",
+//       ];
 
-  const ff = spawnFfmpeg(args);
+//   const ff = spawnFfmpeg(args);
 
-  res.writeHead(200, {
-    "Content-Type": "video/mp4",
-    "Transfer-Encoding": "chunked",
-    "Cache-Control": "no-store",
-  });
+//   res.writeHead(200, {
+//     "Content-Type": "video/mp4",
+//     "Transfer-Encoding": "chunked",
+//     "Cache-Control": "no-store",
+//   });
 
-  let err = "";
-  ff.stdout.pipe(res);
-  ff.stderr.on("data", (d) => (err += d.toString()));
-  ff.on("close", (code) => {
-    if (code !== 0) {
-      console.error("ffmpeg failed:", err || `code ${code}`);
-      if (!res.headersSent) res.status(500).send("ffmpeg error");
-      else try {
-        res.end();
-      } catch {}
-      return;
-    }
-    try {
-      res.end();
-    } catch {}
-  });
+//   let err = "";
+//   ff.stdout.pipe(res);
+//   ff.stderr.on("data", (d) => (err += d.toString()));
+//   ff.on("close", (code) => {
+//     if (code !== 0) {
+//       console.error("ffmpeg failed:", err || `code ${code}`);
+//       if (!res.headersSent) res.status(500).send("ffmpeg error");
+//       else try {
+//         res.end();
+//       } catch {}
+//       return;
+//     }
+//     try {
+//       res.end();
+//     } catch {}
+//   });
 
-  res.on("close", () => {
-    try {
-      ff.kill("SIGKILL");
-    } catch {}
-  });
-}
+//   res.on("close", () => {
+//     try {
+//       ff.kill("SIGKILL");
+//     } catch {}
+//   });
+// }
 
 // -------------------------
 // Helper: normalize times (seconds or milliseconds)
@@ -269,30 +320,33 @@ function normalizeTimes({ start, end, startMs, endMs }) {
 // Automatic cleanup of old temp videos
 // -------------------------
 function cleanupTempFiles() {
-  const tmpDir = os.tmpdir();
-  const videoExts = [".mp4", ".mov", ".avi", ".mkv", ".webm"];
-  let videosFound = false;
-
-  fs.readdir(tmpDir, (err, files) => {
+  const tmpDir = TMP_ROOT;
+  const TTL_MS = 12 * 60 * 60 * 1000; // per-file TTL (12h)
+  fs.readdir(tmpDir, (err, sessions) => {
     if (err) return console.error("Error reading temp directory:", err);
-
-    files.forEach((file) => {
-      const ext = path.extname(file).toLowerCase();
-      if (videoExts.includes(ext)) {
-        videosFound = true;
-        const filePath = path.join(tmpDir, file);
-        fs.unlink(filePath, (err) => {
-          if (err) console.error("Failed to delete old temp video:", filePath);
-          else console.log("Deleted old temp video:", filePath);
+    const now = Date.now();
+    sessions.forEach((sid) => {
+      const sDir = path.join(tmpDir, sid);
+      let allStale = true;
+      try {
+        for (const f of fs.readdirSync(sDir)) {
+          const fp = path.join(sDir, f);
+          const st = fs.statSync(fp);
+          if (now - st.mtimeMs <= TTL_MS) { allStale = false; break; }
+        }
+      } catch {}
+      if (allStale) {
+        fs.rm(sDir, { recursive: true, force: true }, () => {
+          lastTempBySid.delete(sid);
+          console.log("Pruned old session dir:", sDir);
         });
       }
     });
-
-    if (!videosFound) console.log("No temp videos found to delete.");
-    else console.log("Temp video cleanup complete.");
   });
 }
 cleanupTempFiles();
+
+
 
 // -------------------------
 // Helper: get metadata
@@ -326,29 +380,31 @@ async function downloadFile(fileId, filePath) {
 // -------------------------
 app.get("/video/:fileId", async (req, res) => {
   try {
+    const { sid, dir } = sessionDir(req, res);
     const { fileId } = req.params;
     const { size, mimeType, name } = await getFileMetadata(fileId);
-    const localPath = path.join(os.tmpdir(), name);
+    const localPath = path.join(dir, safeBaseName(fileId, name));
 
     if (size > 100 * 1024 * 1024) {
-      // Large file: download to temp
-      if (lastTempFile && lastTempFile !== localPath && fs.existsSync(lastTempFile)) {
-        fs.unlink(lastTempFile, (err) => {
+      // Large file: per-session cache
+      const prev = lastTempBySid.get(sid);
+      if (prev && prev !== localPath && fs.existsSync(prev)) {
+        fs.unlink(prev, (err) => {
           if (err) console.error("Failed to delete previous temp file:", err);
-          else console.log("Deleted previous temp file:", lastTempFile);
+          else console.log("Deleted previous temp file:", prev);
         });
       }
 
       if (!fs.existsSync(localPath)) {
-        console.log("Downloading large file to temp directory...");
+        console.log(`[${sid}] Downloading large file to ${localPath}`);
         await downloadFile(fileId, localPath);
         console.log("Download complete.");
       }
 
-      lastTempFile = localPath;
+      lastTempBySid.set(sid, localPath);
       return streamFile(req, res, localPath, mimeType);
     } else {
-      // Small file: stream directly from Drive
+      // Small file: proxy-stream directly
       const videoUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
       const headers = req.headers.range ? { Range: req.headers.range } : {};
       const videoRes = await fetch(videoUrl, { headers });
@@ -366,6 +422,7 @@ app.get("/video/:fileId", async (req, res) => {
   }
 });
 
+
 // -------------------------
 // Trim video (ms-accurate when ms provided)
 // -------------------------
@@ -375,158 +432,69 @@ app.post("/trim", async (req, res) => {
 
   const release = await gate();
   try {
+    const { sid, dir } = sessionDir(req, res);
     const { name } = await getFileMetadata(fileId);
-    const srcPath = path.join(os.tmpdir(), name);
+    const srcPath = path.join(dir, safeBaseName(fileId, name));
 
     if (!fs.existsSync(srcPath)) {
-      console.log("Downloading source file for trimming...");
+      console.log(`[${sid}] Downloading source file for trimming -> ${srcPath}`);
       await downloadFile(fileId, srcPath);
     }
 
     let { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
-    if (preview) duration = Math.min(duration, 10); // keep previews snappy on tiny instances
-
+    if (preview) duration = Math.min(duration, 10); // keep previews snappy
     const precise = forcePrecise || mode === "precise";
 
     if (preview) {
       // Write a small, seekable preview file and return its URL
-      const outPath = path.join(os.tmpdir(), `preview_${Date.now()}.mp4`);
+      const outPath = path.join(dir, `preview_${Date.now()}.mp4`);
       const args = precise
         ? [
-            "-nostdin",
-            "-i",
-            srcPath,
-            "-ss",
-            String(startSec),
-            "-t",
-            String(duration),
-            "-map",
-            "0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-tune",
-            "zerolatency",
-            "-crf",
-            "30",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "96k",
-            "-threads",
-            "1",
-            "-movflags",
-            "frag_keyframe+empty_moov",
-            "-pix_fmt",
-            "yuv420p",
-            "-y",
-            outPath,
+            "-nostdin","-i",srcPath,"-ss",String(startSec),"-t",String(duration),
+            "-map","0","-c:v","libx264","-preset","ultrafast","-tune","zerolatency",
+            "-crf","30","-c:a","aac","-b:a","96k","-threads","1",
+            "-movflags","frag_keyframe+empty_moov","-pix_fmt","yuv420p","-y",outPath,
           ]
         : [
-            "-nostdin",
-            "-ss",
-            String(startSec),
-            "-t",
-            String(duration),
-            "-i",
-            srcPath,
-            "-map",
-            "0",
-            "-c",
-            "copy",
-            "-fflags",
-            "+genpts",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-threads",
-            "1",
-            "-movflags",
-            "frag_keyframe+empty_moov",
-            "-y",
-            outPath,
+            "-nostdin","-ss",String(startSec),"-t",String(duration),"-i",srcPath,
+            "-map","0","-c","copy","-fflags","+genpts","-avoid_negative_ts","make_zero",
+            "-threads","1","-movflags","frag_keyframe+empty_moov","-y",outPath,
           ];
 
       console.log("ffmpeg (preview)", args.join(" "));
       await runFfmpegWithTimeout(args, {
         onSpawn(ff) {
-          req.on("close", () => {
-            try {
-              ff.kill("SIGKILL");
-            } catch {}
-          });
+          req.on("close", () => { try { ff.kill("SIGKILL"); } catch {} });
         },
         timeoutMs: 120000,
       });
 
       const id = makeId();
-      previews.set(id, outPath);
+      previews.set(id, { path: outPath, sid });
       schedulePreviewCleanup(id, outPath);
 
       res.type("application/json");
       return res.json({ url: `/preview/${id}` });
     }
 
-    // DOWNLOAD: write to /tmp, then stream file
-    const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
+    // DOWNLOAD: write to per-session dir, then stream file
+    const outPath = path.join(dir, `trimmed_${Date.now()}.mp4`);
     const args = precise
       ? [
-          "-nostdin",
-          "-i",
-          srcPath,
-          "-ss",
-          String(startSec),
-          "-t",
-          String(duration),
-          "-map",
-          "0",
-          "-c:v",
-          "libx264",
-          "-preset",
-          "veryfast",
-          "-crf",
-          "20",
-          "-c:a",
-          "aac",
-          "-b:a",
-          "192k",
-          "-threads",
-          "1",
-          "-movflags",
-          "+faststart",
-          "-pix_fmt",
-          "yuv420p",
-          "-y",
-          outPath,
+          "-nostdin","-i",srcPath,"-ss",String(startSec),"-t",String(duration),
+          "-map","0","-c:v","libx264","-preset","veryfast","-crf","20",
+          "-c:a","aac","-b:a","192k","-threads","1","-movflags","+faststart",
+          "-pix_fmt","yuv420p","-y",outPath,
         ]
       : [
-          "-nostdin",
-          "-ss",
-          String(startSec),
-          "-t",
-          String(duration),
-          "-i",
-          srcPath,
-          "-map",
-          "0",
-          "-c",
-          "copy",
-          "-threads",
-          "1",
-          "-movflags",
-          "+faststart",
-          "-y",
-          outPath,
+          "-nostdin","-ss",String(startSec),"-t",String(duration),"-i",srcPath,
+          "-map","0","-c","copy","-threads","1","-movflags","+faststart","-y",outPath,
         ];
 
     console.log("ffmpeg", args.join(" "));
     await runFfmpegWithTimeout(args, {
       onSpawn(ff) {
-        req.on("close", () => {
-          try {
-            ff.kill("SIGKILL");
-          } catch {}
-        });
+        req.on("close", () => { try { ff.kill("SIGKILL"); } catch {} });
       },
       timeoutMs: 10 * 60 * 1000,
     });
@@ -539,6 +507,11 @@ app.post("/trim", async (req, res) => {
     release();
   }
 });
+
+
+
+
+
 
 // GET version (supports ms via startMs/endMs)
 app.get("/trim", async (req, res) => {
