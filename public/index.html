@@ -2,33 +2,40 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Drive API Video Player</title>
+  <!-- NoSleep.js to prevent screen dimming -->
   <script src="https://cdn.jsdelivr.net/npm/nosleep.js@0.12.0/dist/NoSleep.min.js"></script>
   <style>
-    :root { color-scheme: dark; }
     body {
-      background: #111; color: #fff; text-align: center;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      padding: 2rem; margin: 0;
+      background: #111;
+      color: #fff;
+      text-align: center;
+      font-family: system-ui, sans-serif;
+      padding: 2rem;
     }
-    input[type="text"] {
-      width: min(780px, 90%);
-      padding: 0.6rem 0.8rem; font-size: 1rem;
-      border-radius: 8px; border: none; outline: none;
-      background:#1a1a1a; color:#fff;
+    input {
+      width: 70%;
+      padding: 0.6rem;
+      font-size: 1rem;
+      border-radius: 5px;
+      border: none;
     }
-    .row { margin-top: 1rem; }
-    .btn {
-      padding: 0.6rem 1rem; margin: 0.25rem;
-      background: #1db954; border: none; border-radius: 8px;
-      cursor: pointer; font-weight: 600; color:#08130a;
+    button {
+      padding: 0.6rem 1rem;
+      margin-left: 0.5rem;
+      background: #1db954;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
     }
-    .btn:hover { background:#17a84a; }
-    #loader { display:none; margin-top: 0.75rem; }
-    #error { color:#ff6b6b; margin-top: 0.75rem; min-height: 1.25rem; }
-    
+    button:hover { background: #17a84a; }
+    #loader { display: none; margin-top: 1rem; }
+    #error { color: #f66; margin-top: 1rem; }
+    #progress { margin-top: 1rem; width: 80%; height: 1rem; background: #444; border-radius: 5px; overflow: hidden; margin-left: auto; margin-right: auto; display: none; }
+    #progress-bar { width: 0%; height: 100%; background: #1db954; }
 
+    /* Fixed video container */
     #videoContainer {
       width: 90%;
       max-width: 1200px;
@@ -38,19 +45,15 @@
       border-radius: 10px;
       box-shadow: 0 0 15px rgba(0,0,0,0.5);
       display: flex;
-      align-items: center;
       justify-content: center;
+      align-items: center;
       overflow: hidden;
     }
-
-
     #videoContainer video {
       width: 100%;
       height: 100%;
       object-fit: contain;
     }
-
-
   </style>
 </head>
 <body>
@@ -77,42 +80,16 @@
     <button onclick="downloadTrim()">Download Trim</button>
   </div>
 
-  <div class="row">
-    <div class="time-grid">
-      <label for="startHours">Start</label>
-      <input type="number" id="startHours"   min="0" max="23" value="0"> <span class="sep">:</span>
-      <input type="number" id="startMinutes" min="0" max="59" value="0"> <span class="sep">:</span>
-      <input type="number" id="startSeconds" min="0" max="59" value="0"> <span class="sep">.</span>
-      <input type="number" id="startMillis"  min="0" max="999" value="0">
-
-      <label for="endHours" style="margin-left:12px;">End</label>
-      <input type="number" id="endHours"   min="0" max="23" value="0"> <span class="sep">:</span>
-      <input type="number" id="endMinutes" min="0" max="59" value="0"> <span class="sep">:</span>
-      <input type="number" id="endSeconds" min="0" max="59" value="0"> <span class="sep">.</span>
-      <input type="number" id="endMillis"  min="0" max="999" value="0">
-    </div>
-
-    <div class="row">
-      <button class="btn" id="previewBtn">Preview Trim</button>
-      <button class="btn" id="downloadBtn">Download Trim</button>
-      <small class="hint">Tip: whole seconds → fastest preview; milliseconds → precise re-encode.</small>
-    </div>
-  </div>
-
-  <div id="loader">⏳ Working…</div>
+  <div id="loader">⏳ Loading...</div>
+  <div id="progress"><div id="progress-bar"></div></div>
   <div id="error"></div>
   <div id="videoContainer"></div>
 
   <script>
-    // ---- Globals / state ----
     const noSleep = new NoSleep();
     let noSleepEnabled = false;
     let currentFileId = null;
-    let currentVideoEl = null;
-    let currentObjectUrl = null;
-    let previewAbort = null;
 
-    // ---- Helpers ----
     function extractFileId(url) {
       try {
         const patterns = [
@@ -124,8 +101,6 @@
           const m = url.match(p);
           if (m) return m[1];
         }
-        // if they pasted a raw fileId
-        if (/^[A-Za-z0-9_-]{20,}$/.test(url)) return url;
         return null;
       } catch {
         return null;
@@ -133,17 +108,46 @@
     }
 
     async function loadVideo() {
-      setError("");
-      cancelInFlight();
+      const link = document.getElementById("driveLink").value.trim();
+      const fileId = extractFileId(link);
+      currentFileId = fileId;
+      const container = document.getElementById("videoContainer");
+      const error = document.getElementById("error");
+      const loader = document.getElementById("loader");
 
-      const id = getFileIdFromInput();
-      if (!id) { setError("⚠️ Paste a Google Drive link or file ID first."); return; }
+      error.textContent = "";
+      container.innerHTML = "";
+      loader.style.display = "block";
 
-      // HEAD check
-      setLoader(true);
+      if (!fileId) {
+        loader.style.display = "none";
+        error.textContent = "⚠️ Invalid Google Drive link.";
+        return;
+      }
+
       try {
-        const metaRes = await fetch(`/video/${id}`, { method: "HEAD", cache: "no-store" });
+        const metaRes = await fetch(`/video/${fileId}`, { method: "HEAD" });
         if (!metaRes.ok) throw new Error("Video not accessible");
+
+        loader.style.display = "none";
+        container.innerHTML = `
+          <video id="video" playsinline autoplay muted controls loop>
+            <source src="/video/${fileId}" type="video/mp4">
+          </video>
+        `;
+
+        const video = document.getElementById("video");
+
+        document.addEventListener("click", function enable() {
+          if (!noSleepEnabled) {
+            noSleep.enable();
+            noSleepEnabled = true;
+          }
+          video.muted = false;
+          video.play().catch(()=>{});
+          document.removeEventListener("click", enable);
+        });
+
       } catch (e) {
         loader.style.display = "none";
         error.textContent = "❌ " + e.message;
@@ -197,7 +201,6 @@
           body: JSON.stringify({ fileId, startMs, endMs, preview: true })
         });
 
-        setLoader(false);
         if (!res.ok) throw new Error("Trim failed");
 
         const blob = await res.blob();
@@ -210,9 +213,8 @@
         `;
         error.textContent = "";
       } catch (err) {
-        if (err?.name === "AbortError") return; // canceled by us—ignore
-        setLoader(false);
-        setError("❌ " + err.message);
+        container.innerHTML = "";
+        error.textContent = "❌ " + err.message;
       }
     }
 
