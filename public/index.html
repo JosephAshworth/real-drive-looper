@@ -44,11 +44,25 @@
   </style>
 </head>
 <body>
-  <h1>🎥 Google Drive Video Player + Trimmer</h1>
+  <h1>🎥 Google Drive API Video Player + Trimmer</h1>
+  <input id="driveLink" placeholder="Paste Google Drive video link here">
+  <button onclick="loadVideo()">Play</button>
 
-  <div class="row">
-    <input id="driveLink" type="text" placeholder="Paste a Google Drive link OR fileId (no need to load full video first)" />
-    <button class="btn" id="playBtn">Play full video</button>
+  <div style="margin-top:1rem;">
+    <label>Start Time:</label><br>
+    <input type="number" id="startHours" min="0" max="23" value="0" style="width:60px;"> :
+    <input type="number" id="startMinutes" min="0" max="59" value="0" style="width:60px;"> :
+    <input type="number" id="startSeconds" min="0" max="59" value="0" style="width:60px;">
+  
+    <br><br>
+    <label>End Time:</label><br>
+    <input type="number" id="endHours" min="0" max="23" value="0" style="width:60px;"> :
+    <input type="number" id="endMinutes" min="0" max="59" value="0" style="width:60px;"> :
+    <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;">
+  
+    <br><br>
+    <button onclick="previewTrim()">Preview Trim</button>
+    <button onclick="downloadTrim()">Download Trim</button>
   </div>
 
   <div class="row">
@@ -101,91 +115,12 @@
         // if they pasted a raw fileId
         if (/^[A-Za-z0-9_-]{20,}$/.test(url)) return url;
         return null;
-      } catch { return null; }
-    }
-
-    function $(id) { return document.getElementById(id); }
-    function setError(msg="") { $("error").textContent = msg; }
-    function setLoader(show) { $("loader").style.display = show ? "block" : "none"; }
-
-    function clampInput(id, max) {
-      const el = $(id);
-      let v = parseInt(el.value, 10);
-      if (isNaN(v) || v < 0) v = 0;
-      if (v > max) v = max;
-      el.value = v;
-      return v;
-    }
-
-    function formatTimeFromInputs(prefix) {
-      const h  = clampInput(prefix + "Hours", 23);
-      const m  = clampInput(prefix + "Minutes", 59);
-      const s  = clampInput(prefix + "Seconds", 59);
-      const ms = clampInput(prefix + "Millis",  999);
-      const totalMs = (h * 3600 + m * 60 + s) * 1000 + ms;
-      return { seconds: totalMs / 1000, ms: totalMs };
-    }
-
-    function buildTrimQuery(fileId, startT, endT, { preview = false } = {}) {
-      const params = new URLSearchParams({ fileId });
-      const msNonZero = (startT.ms % 1000 !== 0) || (endT.ms % 1000 !== 0);
-      if (msNonZero) {
-        params.set("startMs", String(startT.ms));
-        params.set("endMs",   String(endT.ms));
-        params.set("mode",    "precise");
-      } else {
-        params.set("start", String(Math.floor(startT.seconds)));
-        params.set("end",   String(Math.floor(endT.seconds)));
+      } catch {
+        return null;
       }
-      if (preview) params.set("preview", "1");
-      return `/trim?${params.toString()}`;
     }
 
-    function getFileIdFromInput() {
-      if (currentFileId) return currentFileId;
-      const raw = $("driveLink").value.trim();
-      const id = extractFileId(raw);
-      if (id) currentFileId = id;
-      return id;
-    }
 
-    // Kill previous preview/network + clean up video element & blob URL
-    function cancelInFlight(reason = "new-action") {
-      try { previewAbort?.abort(reason); } catch {}
-      previewAbort = null;
-
-      if (currentVideoEl) {
-        try { currentVideoEl.pause(); } catch {}
-        currentVideoEl.src = ""; // detach
-        currentVideoEl.remove();
-      }
-      if (currentObjectUrl) {
-        URL.revokeObjectURL(currentObjectUrl);
-        currentObjectUrl = null;
-      }
-      $("videoContainer").innerHTML = "";
-    }
-
-    // Always create a fresh <video> so mobile browsers reset their decoders & timelines cleanly
-    function mountVideo(src) {
-      const v = document.createElement("video");
-      v.controls = true;
-      v.autoplay = true;
-      v.loop = true;
-      v.muted = true;        // mobile autoplay policy
-      v.playsInline = true;  // iOS
-      v.preload = "metadata";
-      v.src = src;
-      v.addEventListener("loadedmetadata", () => { /* ready to scrub */ }, { once: true });
-      $("videoContainer").appendChild(v);
-      currentVideoEl = v;
-
-      // Unmute on first gesture
-      const enable = () => { v.muted = false; v.play().catch(()=>{}); document.removeEventListener("click", enable); };
-      document.addEventListener("click", enable);
-    }
-
-    // ---- Play full video (optional) ----
     async function loadVideo() {
       setError("");
       cancelInFlight();
@@ -199,70 +134,65 @@
         const metaRes = await fetch(`/video/${id}`, { method: "HEAD", cache: "no-store" });
         if (!metaRes.ok) throw new Error("Video not accessible");
       } catch (e) {
-        setLoader(false);
-        setError("❌ " + e.message);
+        loader.style.display = "none";
+        error.textContent = "❌ " + e.message;
+      }
+    }
+
+    function sanitizeInput(id, max) {
+      const el = document.getElementById(id);
+      let val = parseInt(el.value, 10);
+      if (isNaN(val) || val < 0) val = 0;
+      if (val > max) val = max;
+      el.value = val; // ✅ always correct visually too
+      return val;
+    }
+
+    function formatTimeFromInputs(prefix) {
+      const h = sanitizeInput(prefix + "Hours", 23);
+      const m = sanitizeInput(prefix + "Minutes", 59);
+      const s = sanitizeInput(prefix + "Seconds", 59);
+      return h * 3600 + m * 60 + s;
+    }
+
+    async function previewTrim() {
+      const error = document.getElementById("error");
+      error.textContent = "";
+
+      if (!currentFileId) {
+        error.textContent = "⚠️ Please load a video first.";
         return;
       }
 
-      setLoader(false);
-      mountVideo(`/video/${id}`);
-      if (!noSleepEnabled) { noSleep.enable(); noSleepEnabled = true; }
-    }
+      const start = formatTimeFromInputs("start");
+      const end = formatTimeFromInputs("end");
 
-    // ---- Preview Trim (no need to load full video first) ----
-    async function previewTrim() {
-      setError("");
-      cancelInFlight(); // stop any previous preview/stream
-
-      const id = getFileIdFromInput();
-      if (!id) { setError("⚠️ Paste a Google Drive link or file ID first."); return; }
-
-      const startT = formatTimeFromInputs("start");
-      const endT   = formatTimeFromInputs("end");
-      if (endT.ms <= startT.ms) { setError("⚠️ End time must be after start time."); return; }
-
-      setLoader(true);
-
-      // Prepare body – only send ms when they matter
-      const msNonZero = (startT.ms % 1000 !== 0) || (endT.ms % 1000 !== 0);
-      const body = { fileId: id, preview: true };
-      if (msNonZero) {
-        body.startMs = startT.ms; body.endMs = endT.ms; body.mode = "precise";
-      } else {
-        body.start = Math.floor(startT.seconds); body.end = Math.floor(endT.seconds);
+      if (end <= start) {
+        error.textContent = "⚠️ End time must be after start time.";
+        return;
       }
 
-      // Make an abortable request
-      previewAbort = new AbortController();
-      const { signal } = previewAbort;
+      const container = document.getElementById("videoContainer");
+      container.innerHTML = "⏳ Trimming preview...";
 
       try {
         const res = await fetch("/trim", {
           method: "POST",
-          headers: { "Content-Type": "application/json", "Accept": "application/json" },
-          cache: "no-store",
-          body: JSON.stringify(body),
-          signal
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fileId: currentFileId, start, end, preview: true })
         });
 
         setLoader(false);
         if (!res.ok) throw new Error("Trim failed");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
 
-        const ct = res.headers.get("content-type") || "";
-        let src;
-        if (ct.includes("application/json")) {
-          const data = await res.json();
-          if (!data?.url) throw new Error("Missing preview URL");
-          src = data.url; // Range-enabled; best scrubbing
-        } else if (ct.startsWith("video/")) {
-          const blob = await res.blob();
-          src = currentObjectUrl = URL.createObjectURL(blob);
-        } else {
-          throw new Error("Unexpected response type");
-        }
-
-        mountVideo(src);
-        if (!noSleepEnabled) { noSleep.enable(); noSleepEnabled = true; }
+        container.innerHTML = `
+          <video controls autoplay style="width:100%;border-radius:10px;">
+            <source src="${url}" type="video/mp4">
+          </video>
+        `;
+        error.textContent = "";
       } catch (err) {
         if (err?.name === "AbortError") return; // canceled by us—ignore
         setLoader(false);
@@ -270,38 +200,48 @@
       }
     }
 
+
+
+
     function downloadTrim() {
-      setError("");
-      const id = getFileIdFromInput();
-      if (!id) { setError("⚠️ Paste a Google Drive link or file ID first."); return; }
+      const error = document.getElementById("error");
+      error.textContent = "";
 
-      const startT = formatTimeFromInputs("start");
-      const endT   = formatTimeFromInputs("end");
-      if (endT.ms <= startT.ms) { setError("⚠️ End time must be after start time."); return; }
+      if (!currentFileId) {
+        error.textContent = "⚠️ Please load a video first.";
+        return;
+      }
 
-      const url = buildTrimQuery(id, startT, endT, { preview: false });
-      window.location.href = url; // browser download
+      const start = formatTimeFromInputs("start");
+      const end = formatTimeFromInputs("end");
+
+      if (end <= start) {
+        error.textContent = "⚠️ End time must be after start time.";
+        return;
+      }
+
+      window.location.href = `/trim?fileId=${currentFileId}&start=${start}&end=${end}`;
     }
 
-    // ---- Wiring & lifecycle ----
-    $("playBtn").addEventListener("click", loadVideo);
-    $("previewBtn").addEventListener("click", previewTrim);
-    $("downloadBtn").addEventListener("click", downloadTrim);
 
-    // Clamp all time inputs
-    ["startHours","startMinutes","startSeconds","startMillis",
-     "endHours","endMinutes","endSeconds","endMillis"].forEach(id => {
-      $(id).addEventListener("input", () => {
-        const max = id.includes("Hours") ? 23 : id.includes("Millis") ? 999 : 59;
-        clampInput(id, max);
-      });
+
+    // 🔧 Auto-correct time inputs live as the user types
+    function clampValue(input, max) {
+      let val = parseInt(input.value, 10);
+      if (isNaN(val) || val < 0) val = 0;
+      if (val > max) val = max;
+      input.value = val;
+    }
+
+    // Apply live clamping to all hour/min/sec inputs
+    ["startHours","startMinutes","startSeconds","endHours","endMinutes","endSeconds"].forEach(id => {
+      const el = document.getElementById(id);
+      const max = id.includes("Hours") ? 23 : 59;
+      el.addEventListener("input", () => clampValue(el, max));
     });
 
-    // Abort/cleanup on page hide or unload (stops previous preview still loading on refresh)
-    window.addEventListener("beforeunload", () => cancelInFlight("unload"));
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "hidden") cancelInFlight("hidden");
-    });
+
+
   </script>
 </body>
 </html>
