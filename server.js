@@ -53,6 +53,21 @@ function cleanupTempFiles() {
 }
 cleanupTempFiles();
 
+
+// -------- Render/cache toggles --------
+const DISABLE_LOCAL_CACHE = process.env.DISABLE_LOCAL_CACHE === "1" || !!process.env.RENDER;
+
+// verify a local file is complete (matches Drive size)
+function isCompleteFile(p, expectedSize) {
+  try {
+    const st = fs.statSync(p);
+    return st.size === expectedSize;
+  } catch {
+    return false;
+  }
+}
+
+
 // -------------------------
 // Helpers: ms + cache + accurate ffmpeg
 // -------------------------
@@ -130,18 +145,26 @@ async function getFileMetadata(fileId) {
 // -------------------------
 // Download file to temp directory
 // -------------------------
-async function downloadFile(fileId, filePath) {
+// Download file and verify size matches Drive
+async function downloadFile(fileId, filePath, expectedSize) {
   const url = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error("Failed to download file from Google Drive");
 
-  const fileStream = fs.createWriteStream(filePath);
   await new Promise((resolve, reject) => {
-    res.body.pipe(fileStream);
+    const ws = fs.createWriteStream(filePath);
+    res.body.pipe(ws);
     res.body.on("error", reject);
-    fileStream.on("finish", resolve);
+    ws.on("finish", resolve);
   });
+
+  // verify and nuke partials
+  if (!isCompleteFile(filePath, expectedSize)) {
+    try { fs.unlinkSync(filePath); } catch {}
+    throw new Error("Partial download detected (size mismatch).");
+  }
 }
+
 
 // -------------------------
 // Stream file with range support
@@ -183,8 +206,20 @@ app.get("/video/:fileId", async (req, res) => {
     const { size, mimeType, name } = await getFileMetadata(fileId);
     const localPath = cachePathFor(fileId, name);
 
+    // If caching is disabled (e.g., on Render), always stream over HTTP
+    if (DISABLE_LOCAL_CACHE) {
+      const videoUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
+      const headers = req.headers.range ? { Range: req.headers.range } : {};
+      const videoRes = await fetch(videoUrl, { headers });
+      res.writeHead(videoRes.status, {
+        "Content-Type": mimeType,
+        ...Object.fromEntries(videoRes.headers.entries()),
+      });
+      return videoRes.body.pipe(res);
+    }
+
+    // Otherwise, cache large files locally (but verify size to avoid partials)
     if (size > 100 * 1024 * 1024) {
-      // Large file: download to temp
       if (lastTempFile && lastTempFile !== localPath && fs.existsSync(lastTempFile)) {
         fs.unlink(lastTempFile, (err) => {
           if (err) console.error("Failed to delete previous temp file:", err);
@@ -192,32 +227,32 @@ app.get("/video/:fileId", async (req, res) => {
         });
       }
 
-      if (!fs.existsSync(localPath)) {
+      if (!isCompleteFile(localPath, size)) {
         console.log("Downloading large file to temp directory...");
-        await downloadFile(fileId, localPath);
+        await downloadFile(fileId, localPath, size);
         console.log("Download complete.");
       }
 
       lastTempFile = localPath;
       return streamFile(req, res, localPath, mimeType);
-    } else {
-      // Small file: stream directly from Drive
-      const videoUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
-      const headers = req.headers.range ? { Range: req.headers.range } : {};
-      const videoRes = await fetch(videoUrl, { headers });
-
-      res.writeHead(videoRes.status, {
-        "Content-Type": mimeType,
-        ...Object.fromEntries(videoRes.headers.entries()),
-      });
-
-      return videoRes.body.pipe(res);
     }
+
+    // Small files: stream directly from Drive
+    const videoUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
+    const headers = req.headers.range ? { Range: req.headers.range } : {};
+    const videoRes = await fetch(videoUrl, { headers });
+    res.writeHead(videoRes.status, {
+      "Content-Type": mimeType,
+      ...Object.fromEntries(videoRes.headers.entries()),
+    });
+    return videoRes.body.pipe(res);
   } catch (err) {
     console.error(err);
     res.status(500).send("❌ " + err.message);
   }
 });
+
+
 
 // -------------------------
 // ✅ Trim video route (Preview: accurate; Download: accurate)
@@ -227,19 +262,27 @@ app.post("/trim", async (req, res) => {
   if (!fileId) return res.status(400).send("Missing parameters.");
 
   try {
-    const { name } = await getFileMetadata(fileId);
+    const { name, size } = await getFileMetadata(fileId);
     const srcPath = cachePathFor(fileId, name);
-
-    // Prefer HTTP input for previews when not cached (no full download)
     const inputUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
-    let inputForFfmpeg = fs.existsSync(srcPath) ? srcPath : inputUrl;
-
-    // If not cached and NOT preview (i.e., download via POST), download
-    if (!fs.existsSync(srcPath) && !preview) {
-      console.log("Downloading source file for trimming...");
-      await downloadFile(fileId, srcPath);
+  
+    // Choose input: on Render (or disabled cache) use HTTP; otherwise use verified local file
+    let inputForFfmpeg;
+    if (DISABLE_LOCAL_CACHE) {
+      inputForFfmpeg = inputUrl;
+    } else if (!isCompleteFile(srcPath, size)) {
+      if (!preview) {
+        console.log("Downloading source file for trimming...");
+        await downloadFile(fileId, srcPath, size);
+        inputForFfmpeg = srcPath;
+      } else {
+        console.log("Using HTTP input for preview (no local cache).");
+        inputForFfmpeg = inputUrl;
+      }
+    } else {
       inputForFfmpeg = srcPath;
     }
+  
 
     // Parse time (ms preferred)
     const { startMs, endMs } = parseTimeInputs(req.body);
@@ -275,27 +318,34 @@ app.get("/trim", async (req, res) => {
   if (!fileId) return res.status(400).send("Missing parameters.");
 
   try {
-    const { name } = await getFileMetadata(fileId);
+    const { name, size } = await getFileMetadata(fileId);
     const srcPath = cachePathFor(fileId, name);
-
-    // Ensure local file for stability (optional to switch to HTTP if you prefer)
-    if (!fs.existsSync(srcPath)) {
+    const inputUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
+  
+    let inputForFfmpeg;
+    if (DISABLE_LOCAL_CACHE) {
+      inputForFfmpeg = inputUrl;
+    } else if (!isCompleteFile(srcPath, size)) {
       console.log("Downloading file for trim...");
-      await downloadFile(fileId, srcPath);
+      await downloadFile(fileId, srcPath, size);
+      inputForFfmpeg = srcPath;
+    } else {
+      inputForFfmpeg = srcPath;
     }
-
+  
     const { startMs, endMs } = parseTimeInputs(req.query);
     if (!(endMs > startMs)) throw new Error("End must be after start.");
-
+  
     const startTS = msToTimestamp(startMs);
     const durTS   = msToTimestamp(endMs - startMs);
-
+  
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
-
-    // Download: accurate seek & re-encode (better quality than preview)
-    const cmd = ffmpegAccurateCmd(srcPath, startTS, durTS, outPath, "veryfast", 18, "192k");
+  
+    // Accurate cut (matches preview exactly), better quality for downloads
+    const cmd = ffmpegAccurateCmd(inputForFfmpeg, startTS, durTS, outPath, "veryfast", 18, "192k");
     console.log("Running:", cmd);
     await execPromise(cmd);
+  
 
     res.download(outPath, "trimmed_video.mp4", () => fs.unlink(outPath, () => {}));
   } catch (err) {
