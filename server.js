@@ -103,6 +103,40 @@ function ffmpegAccurateCmd(input, startTS, durTS, outPath, preset = "veryfast", 
   ].join(" ");
 }
 
+
+// Fast-but-accurate-enough preview: hybrid seek + lightweight encode
+function ffmpegFastPreviewCmd(input, startMs, endMs, outPath) {
+  // coarse seek back a little so the fine seek is small
+  const backoff = 3000; // ms backoff (3s) — tune 1000–5000
+  const coarseMs = Math.max(0, startMs - backoff);
+  const fineMs   = startMs - coarseMs;
+
+  const coarseTS = msToTimestamp(coarseMs);
+  const fineTS   = msToTimestamp(fineMs);
+  const durTS    = msToTimestamp(Math.max(1, endMs - startMs));
+
+  // Notes:
+  // - first -ss BEFORE -i lets ffmpeg HTTP-range seek near coarseTS (fast)
+  // - second -ss AFTER -i does a tiny accurate hop to the exact millisecond
+  // - 360p + ultrafast + higher CRF keeps preview snappy on Render
+  // - lower probesize/analyzeduration reduces IO wait on remote HTTP
+  return [
+    `ffmpeg -hide_banner -loglevel error -nostdin`,
+    `-ss ${coarseTS}`,
+    `-analyzeduration 0 -probesize 32k`,
+    `-rw_timeout 15000000`,               // 15s network read timeout
+    `-i "${input}"`,
+    `-ss ${fineTS}`,
+    `-t ${durTS}`,
+    `-vf scale='-2:360'`,                 // shrink for speed
+    `-c:v libx264 -preset ultrafast -crf 28`,
+    `-c:a aac -b:a 96k`,
+    `-movflags +faststart`,
+    `-y "${outPath}"`
+  ].join(" ");
+}
+
+
 // Parse times from request (ms preferred; supports seconds or HH:MM:SS.mmm)
 function parseTimeInputs(q) {
   if (q.startMs != null && q.endMs != null) {
@@ -288,15 +322,21 @@ app.post("/trim", async (req, res) => {
     const { startMs, endMs } = parseTimeInputs(req.body);
     if (!(endMs > startMs)) throw new Error("End must be after start.");
 
-    const startTS = msToTimestamp(startMs);
-    const durTS   = msToTimestamp(endMs - startMs);
-
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
 
-    // Preview: accurate seek & re-encode (ultrafast to stay snappy)
-    const cmd = ffmpegAccurateCmd(inputForFfmpeg, startTS, durTS, outPath, "ultrafast", 20, "160k");
+    let cmd;
+    if (preview) {
+      // Fast hybrid seek preview — accurate to ms, but much quicker on Render
+      cmd = ffmpegFastPreviewCmd(inputForFfmpeg, startMs, endMs, outPath);
+    } else {
+      // Download: keep the accurate, better-quality encode
+      const durTS = msToTimestamp(endMs - startMs);
+      const startTS = msToTimestamp(startMs);
+      cmd = ffmpegAccurateCmd(inputForFfmpeg, startTS, durTS, outPath, "veryfast", 18, "192k");
+    }
     console.log("Running:", cmd);
     await execPromise(cmd);
+
 
     if (preview) {
       const buffer = fs.readFileSync(outPath);
