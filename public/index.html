@@ -27,20 +27,30 @@
     .btn:hover { background:#17a84a; }
     #loader { display:none; margin-top: 0.75rem; }
     #error { color:#ff6b6b; margin-top: 0.75rem; min-height: 1.25rem; }
+    
+
     #videoContainer {
-      width: 90%; max-width: 1200px; aspect-ratio: 16 / 9;
-      background: #000; margin: 1.5rem auto 0; border-radius: 12px;
+      width: 90%;
+      max-width: 1200px;
+      aspect-ratio: 16 / 9;
+      background-color: black;
+      margin: 2rem auto 0;
+      border-radius: 10px;
       box-shadow: 0 0 15px rgba(0,0,0,0.5);
-      display:flex; align-items:center; justify-content:center; overflow:hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
     }
-    video {
-      width: 100%; height: 100%; object-fit: contain;
-      background:#000; border-radius: 12px;
+
+
+    #videoContainer video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
     }
-    .time-grid { display:inline-grid; grid-template-columns: repeat(8, max-content); gap: 6px 8px; align-items: center; }
-    .time-grid input { width: 72px; padding: 0.35rem 0.5rem; border-radius: 6px; border: none; background:#1a1a1a; color:#fff; }
-    .sep { opacity: 0.6; }
-    small.hint { display:block; opacity:0.7; margin-top:0.5rem; }
+
+
   </style>
 </head>
 <body>
@@ -62,7 +72,6 @@
     <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;"> .
     <input type="number" id="endMillis"  min="0" max="999" value="0" style="width:80px;" placeholder="ms">
 
-  
     <br><br>
     <button onclick="previewTrim()">Preview Trim</button>
     <button onclick="downloadTrim()">Download Trim</button>
@@ -123,17 +132,6 @@
       }
     }
 
-    function getOrSetFileIdFromInput() {
-      if (currentFileId) return currentFileId;
-      const link = document.getElementById("driveLink").value.trim();
-      const fid = extractFileId(link);
-      if (!fid) throw new Error("Invalid Google Drive link.");
-      currentFileId = fid;
-      return fid;
-    }
-
-
-
     async function loadVideo() {
       setError("");
       cancelInFlight();
@@ -157,7 +155,7 @@
       let val = parseInt(el.value, 10);
       if (isNaN(val) || val < 0) val = 0;
       if (val > max) val = max;
-      el.value = val; // ✅ always correct visually too
+      el.value = val;
       return val;
     }
 
@@ -169,23 +167,21 @@
       return h * 3600000 + m * 60000 + s * 1000 + ms;
     }
 
-
     async function previewTrim() {
       const error = document.getElementById("error");
       error.textContent = "";
 
-      // 🔁 Always extract a fresh fileId from the input (ignore any previous currentFileId)
+      // Always read a fresh fileId (no need to press Play first)
       const link = document.getElementById("driveLink").value.trim();
       const fileId = extractFileId(link);
       if (!fileId) {
         error.textContent = "⚠️ Invalid Google Drive link.";
         return;
       }
-      currentFileId = fileId; // keep in sync for Play/download
+      currentFileId = fileId;
 
       const startMs = timeMsFromInputs("start");
       const endMs   = timeMsFromInputs("end");
-
       if (endMs <= startMs) {
         error.textContent = "⚠️ End time must be after start time.";
         return;
@@ -220,25 +216,21 @@
       }
     }
 
-
-
-
     function downloadTrim() {
       const error = document.getElementById("error");
       error.textContent = "";
 
-      // always extract a fresh fileId from the input (avoid stale currentFileId)
+      // Always read a fresh fileId to match preview exactly
       const link = document.getElementById("driveLink").value.trim();
       const fileId = extractFileId(link);
       if (!fileId) {
         error.textContent = "⚠️ Invalid Google Drive link.";
         return;
       }
-      currentFileId = fileId; // keep in sync with Play
+      currentFileId = fileId;
 
       const startMs = timeMsFromInputs("start");
       const endMs   = timeMsFromInputs("end");
-
       if (endMs <= startMs) {
         error.textContent = "⚠️ End time must be after start time.";
         return;
@@ -248,30 +240,25 @@
       window.location.href = `/trim?${u.toString()}`;
     }
 
+    // Clear preview/error when link changes (prevents confusion)
+    document.getElementById("driveLink").addEventListener("input", () => {
+      document.getElementById("videoContainer").innerHTML = "";
+      document.getElementById("error").textContent = "";
+    });
 
-
-
-
-
-    // 🔧 Auto-correct time inputs live as the user types
+    // Live clamping for all inputs (incl. ms)
     function clampValue(input, max) {
       let val = parseInt(input.value, 10);
       if (isNaN(val) || val < 0) val = 0;
       if (val > max) val = max;
       input.value = val;
     }
-
-    // Apply live clamping to all hour/min/sec inputs
     ["startHours","startMinutes","startSeconds","startMillis",
-    "endHours","endMinutes","endSeconds","endMillis"].forEach(id => {
+     "endHours","endMinutes","endSeconds","endMillis"].forEach(id => {
       const el = document.getElementById(id);
       const max = id.includes("Hours") ? 23 : id.includes("Millis") ? 999 : 59;
       el.addEventListener("input", () => clampValue(el, max));
     });
-
-
-
-
   </script>
 </body>
 </html>

@@ -5,13 +5,13 @@ import fs from "fs";
 import path from "path";
 import os from "node:os";
 import { exec } from "child_process";
-import util from "util";  // ✅ Added for promisified exec
+import util from "util";  // ✅ promisified exec
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY;
-const execPromise = util.promisify(exec); // ✅ for async ffmpeg commands
+const execPromise = util.promisify(exec);
 
 if (!API_KEY) {
   console.error("❌ Missing GOOGLE_API_KEY in .env file");
@@ -19,7 +19,7 @@ if (!API_KEY) {
 }
 
 app.use(express.static("public"));
-app.use(express.json()); // ✅ Added for JSON parsing (needed for POST /trim)
+app.use(express.json());
 
 // Track last downloaded temp file
 let lastTempFile = null;
@@ -51,13 +51,11 @@ function cleanupTempFiles() {
     else console.log("Temp video cleanup complete.");
   });
 }
-
-// Run cleanup on server startup
 cleanupTempFiles();
 
-
-
-// ---- Millisecond helpers ----
+// -------------------------
+// Helpers: ms + cache + accurate ffmpeg
+// -------------------------
 function msToTimestamp(ms) {
   const sign = ms < 0 ? "-" : "";
   ms = Math.max(0, Math.abs(ms));
@@ -66,22 +64,17 @@ function msToTimestamp(ms) {
   const ss  = Math.floor((ms % 60000) / 1000);
   const mmm = ms % 1000;
   const pad = (n, l = 2) => String(n).padStart(l, "0");
-  return `${sign}${pad(hh)}:${pad(mm)}:${pad(ss)}.${pad(mmm, 3)}`;
+  return `${sign}${pad(hh)}:${pad(mm)}:${pad(ss)}.${pad(mmm,3)}`;
 }
-
-
 
 function safeName(name) {
   return name.replace(/[^a-zA-Z0-9._-]+/g, "_");
 }
-
-
-
 function cachePathFor(fileId, name) {
   return path.join(os.tmpdir(), `${fileId}_${safeName(name)}`);
 }
 
-// ✅ Accurate, millisecond-precise trim command
+// Accurate, millisecond-precise trim command
 function ffmpegAccurateCmd(input, startTS, durTS, outPath, preset = "veryfast", crf = 18, audioBitrate = "192k") {
   return [
     `ffmpeg -hide_banner -loglevel error`,
@@ -90,17 +83,13 @@ function ffmpegAccurateCmd(input, startTS, durTS, outPath, preset = "veryfast", 
     `-t ${durTS}`,
     `-c:v libx264 -preset ${preset} -crf ${crf}`,
     `-c:a aac -b:a ${audioBitrate}`,
-    `-movflags +faststart -fflags +genpts -avoid_negative_ts make_zero`,
+    `-movflags +faststart`,
     `-y "${outPath}"`
   ].join(" ");
 }
 
-
-
-
-
+// Parse times from request (ms preferred; supports seconds or HH:MM:SS.mmm)
 function parseTimeInputs(q) {
-  // Preferred: startMs/endMs numeric (milliseconds)
   if (q.startMs != null && q.endMs != null) {
     const startMs = Number(q.startMs);
     const endMs   = Number(q.endMs);
@@ -109,16 +98,12 @@ function parseTimeInputs(q) {
     }
     return { startMs, endMs };
   }
-
-  // Fallback: numeric seconds
   const isNum = (v) => v != null && /^\d+(\.\d+)?$/.test(String(v));
   if (isNum(q.start) && isNum(q.end)) {
     const startMs = Math.round(parseFloat(q.start) * 1000);
     const endMs   = Math.round(parseFloat(q.end) * 1000);
     return { startMs, endMs };
   }
-
-  // Fallback: HH:MM:SS.mmm
   if (q.start && q.end) {
     const toMs = (ts) => {
       const m = String(ts).trim().match(/^(\d+):([0-5]?\d):([0-5]?\d)(?:\.(\d{1,3}))?$/);
@@ -128,11 +113,8 @@ function parseTimeInputs(q) {
     };
     return { startMs: toMs(q.start), endMs: toMs(q.end) };
   }
-
   throw new Error("Missing parameters.");
 }
-
-
 
 // -------------------------
 // Helper: get metadata
@@ -201,7 +183,6 @@ app.get("/video/:fileId", async (req, res) => {
     const { size, mimeType, name } = await getFileMetadata(fileId);
     const localPath = cachePathFor(fileId, name);
 
-
     if (size > 100 * 1024 * 1024) {
       // Large file: download to temp
       if (lastTempFile && lastTempFile !== localPath && fs.existsSync(lastTempFile)) {
@@ -238,10 +219,8 @@ app.get("/video/:fileId", async (req, res) => {
   }
 });
 
-
-
 // -------------------------
-// ✅ NEW: Trim video route (supports preview without full download)
+// ✅ Trim video route (Preview: accurate; Download: accurate)
 // -------------------------
 app.post("/trim", async (req, res) => {
   const { fileId, preview } = req.body;
@@ -251,48 +230,30 @@ app.post("/trim", async (req, res) => {
     const { name } = await getFileMetadata(fileId);
     const srcPath = cachePathFor(fileId, name);
 
-
+    // Prefer HTTP input for previews when not cached (no full download)
     const inputUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
     let inputForFfmpeg = fs.existsSync(srcPath) ? srcPath : inputUrl;
-    // then use inputForFfmpeg in both ffmpeg commands
 
-
-    if (!fs.existsSync(srcPath)) {
-      if (preview) {
-        console.log("Using HTTP input for preview (no full download)…"); // ← added
-        inputForFfmpeg = inputUrl; // ← added
-      } else {
-        console.log("Downloading source file for trimming...");
-        await downloadFile(fileId, srcPath);
-      }
+    // If not cached and NOT preview (i.e., download via POST), download
+    if (!fs.existsSync(srcPath) && !preview) {
+      console.log("Downloading source file for trimming...");
+      await downloadFile(fileId, srcPath);
+      inputForFfmpeg = srcPath;
     }
 
-    // Parse time (supports startMs/endMs, numeric seconds, or HH:MM:SS.mmm)
+    // Parse time (ms preferred)
     const { startMs, endMs } = parseTimeInputs(req.body);
     if (!(endMs > startMs)) throw new Error("End must be after start.");
 
     const startTS = msToTimestamp(startMs);
     const durTS   = msToTimestamp(endMs - startMs);
 
-
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
 
-    // Accurate preview (millisecond-precise): -ss AFTER -i + re-encode video
-    const cmd = [
-      'ffmpeg -hide_banner -loglevel error',
-      `-i "${fs.existsSync(srcPath) ? srcPath : inputUrl}"`, // input first!
-      `-ss ${startTS}`,
-      `-t ${durTS}`,
-      `-c:v libx264 -preset ultrafast -crf 20`,
-      `-c:a aac -b:a 160k`,
-      `-movflags +faststart`,
-      `-y "${outPath}"`
-    ].join(' ');
-    console.log('Running:', cmd);
+    // Preview: accurate seek & re-encode (ultrafast to stay snappy)
+    const cmd = ffmpegAccurateCmd(inputForFfmpeg, startTS, durTS, outPath, "ultrafast", 20, "160k");
+    console.log("Running:", cmd);
     await execPromise(cmd);
-
-
-
 
     if (preview) {
       const buffer = fs.readFileSync(outPath);
@@ -308,9 +269,7 @@ app.post("/trim", async (req, res) => {
   }
 });
 
-
-
-// ✅ Also support GET version for direct downloads
+// ✅ GET version for direct downloads (accurate, matches preview exactly)
 app.get("/trim", async (req, res) => {
   const { fileId } = req.query;
   if (!fileId) return res.status(400).send("Missing parameters.");
@@ -319,7 +278,7 @@ app.get("/trim", async (req, res) => {
     const { name } = await getFileMetadata(fileId);
     const srcPath = cachePathFor(fileId, name);
 
-
+    // Ensure local file for stability (optional to switch to HTTP if you prefer)
     if (!fs.existsSync(srcPath)) {
       console.log("Downloading file for trim...");
       await downloadFile(fileId, srcPath);
@@ -333,12 +292,10 @@ app.get("/trim", async (req, res) => {
 
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
 
-    // Download should be accurate and higher quality -> veryfast/CRF 18
+    // Download: accurate seek & re-encode (better quality than preview)
     const cmd = ffmpegAccurateCmd(srcPath, startTS, durTS, outPath, "veryfast", 18, "192k");
     console.log("Running:", cmd);
     await execPromise(cmd);
-
-
 
     res.download(outPath, "trimmed_video.mp4", () => fs.unlink(outPath, () => {}));
   } catch (err) {
@@ -346,6 +303,5 @@ app.get("/trim", async (req, res) => {
     res.status(500).send("❌ Failed to trim video: " + err.message);
   }
 });
-
 
 app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));
