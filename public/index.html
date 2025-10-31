@@ -50,15 +50,18 @@
 
   <div style="margin-top:1rem;">
     <label>Start Time:</label><br>
-    <input type="number" id="startHours" min="0" max="23" value="0" style="width:60px;"> :
+    <input type="number" id="startHours"   min="0" max="23" value="0" style="width:60px;"> :
     <input type="number" id="startMinutes" min="0" max="59" value="0" style="width:60px;"> :
-    <input type="number" id="startSeconds" min="0" max="59" value="0" style="width:60px;">
-  
+    <input type="number" id="startSeconds" min="0" max="59" value="0" style="width:60px;"> .
+    <input type="number" id="startMillis"  min="0" max="999" value="0" style="width:80px;" placeholder="ms">
+
     <br><br>
     <label>End Time:</label><br>
-    <input type="number" id="endHours" min="0" max="23" value="0" style="width:60px;"> :
+    <input type="number" id="endHours"   min="0" max="23" value="0" style="width:60px;"> :
     <input type="number" id="endMinutes" min="0" max="59" value="0" style="width:60px;"> :
-    <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;">
+    <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;"> .
+    <input type="number" id="endMillis"  min="0" max="999" value="0" style="width:80px;" placeholder="ms">
+
   
     <br><br>
     <button onclick="previewTrim()">Preview Trim</button>
@@ -120,6 +123,16 @@
       }
     }
 
+    function getOrSetFileIdFromInput() {
+      if (currentFileId) return currentFileId;
+      const link = document.getElementById("driveLink").value.trim();
+      const fid = extractFileId(link);
+      if (!fid) throw new Error("Invalid Google Drive link.");
+      currentFileId = fid;
+      return fid;
+    }
+
+
 
     async function loadVideo() {
       setError("");
@@ -148,26 +161,32 @@
       return val;
     }
 
-    function formatTimeFromInputs(prefix) {
-      const h = sanitizeInput(prefix + "Hours", 23);
-      const m = sanitizeInput(prefix + "Minutes", 59);
-      const s = sanitizeInput(prefix + "Seconds", 59);
-      return h * 3600 + m * 60 + s;
+    function timeMsFromInputs(prefix) {
+      const h  = sanitizeInput(prefix + "Hours", 23);
+      const m  = sanitizeInput(prefix + "Minutes", 59);
+      const s  = sanitizeInput(prefix + "Seconds", 59);
+      const ms = sanitizeInput(prefix + "Millis", 999);
+      return h * 3600000 + m * 60000 + s * 1000 + ms;
     }
+
 
     async function previewTrim() {
       const error = document.getElementById("error");
       error.textContent = "";
 
-      if (!currentFileId) {
-        error.textContent = "⚠️ Please load a video first.";
+      // 🔁 Always extract a fresh fileId from the input (ignore any previous currentFileId)
+      const link = document.getElementById("driveLink").value.trim();
+      const fileId = extractFileId(link);
+      if (!fileId) {
+        error.textContent = "⚠️ Invalid Google Drive link.";
         return;
       }
+      currentFileId = fileId; // keep in sync for Play/download
 
-      const start = formatTimeFromInputs("start");
-      const end = formatTimeFromInputs("end");
+      const startMs = timeMsFromInputs("start");
+      const endMs   = timeMsFromInputs("end");
 
-      if (end <= start) {
+      if (endMs <= startMs) {
         error.textContent = "⚠️ End time must be after start time.";
         return;
       }
@@ -179,11 +198,12 @@
         const res = await fetch("/trim", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ fileId: currentFileId, start, end, preview: true })
+          body: JSON.stringify({ fileId, startMs, endMs, preview: true })
         });
 
         setLoader(false);
         if (!res.ok) throw new Error("Trim failed");
+
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
 
@@ -207,21 +227,29 @@
       const error = document.getElementById("error");
       error.textContent = "";
 
-      if (!currentFileId) {
-        error.textContent = "⚠️ Please load a video first.";
+      // always extract a fresh fileId from the input (avoid stale currentFileId)
+      const link = document.getElementById("driveLink").value.trim();
+      const fileId = extractFileId(link);
+      if (!fileId) {
+        error.textContent = "⚠️ Invalid Google Drive link.";
         return;
       }
+      currentFileId = fileId; // keep in sync with Play
 
-      const start = formatTimeFromInputs("start");
-      const end = formatTimeFromInputs("end");
+      const startMs = timeMsFromInputs("start");
+      const endMs   = timeMsFromInputs("end");
 
-      if (end <= start) {
+      if (endMs <= startMs) {
         error.textContent = "⚠️ End time must be after start time.";
         return;
       }
 
-      window.location.href = `/trim?fileId=${currentFileId}&start=${start}&end=${end}`;
+      const u = new URLSearchParams({ fileId, startMs: String(startMs), endMs: String(endMs) });
+      window.location.href = `/trim?${u.toString()}`;
     }
+
+
+
 
 
 
@@ -234,11 +262,13 @@
     }
 
     // Apply live clamping to all hour/min/sec inputs
-    ["startHours","startMinutes","startSeconds","endHours","endMinutes","endSeconds"].forEach(id => {
+    ["startHours","startMinutes","startSeconds","startMillis",
+    "endHours","endMinutes","endSeconds","endMillis"].forEach(id => {
       const el = document.getElementById(id);
-      const max = id.includes("Hours") ? 23 : 59;
+      const max = id.includes("Hours") ? 23 : id.includes("Millis") ? 999 : 59;
       el.addEventListener("input", () => clampValue(el, max));
     });
+
 
 
 
