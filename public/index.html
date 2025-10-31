@@ -2,349 +2,306 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Drive API Video Player</title>
-  <!-- NoSleep.js to prevent screen dimming -->
   <script src="https://cdn.jsdelivr.net/npm/nosleep.js@0.12.0/dist/NoSleep.min.js"></script>
   <style>
+    :root { color-scheme: dark; }
     body {
-      background: #111;
-      color: #fff;
-      text-align: center;
-      font-family: system-ui, sans-serif;
-      padding: 2rem;
+      background: #111; color: #fff; text-align: center;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      padding: 2rem; margin: 0;
     }
-    input {
-      width: 70%;
-      padding: 0.6rem;
-      font-size: 1rem;
-      border-radius: 5px;
-      border: none;
+    input[type="text"] {
+      width: min(780px, 90%);
+      padding: 0.6rem 0.8rem; font-size: 1rem;
+      border-radius: 8px; border: none; outline: none;
+      background:#1a1a1a; color:#fff;
     }
-    button {
-      padding: 0.6rem 1rem;
-      margin-left: 0.5rem;
-      background: #1db954;
-      border: none;
-      border-radius: 5px;
-      cursor: pointer;
+    .row { margin-top: 1rem; }
+    .btn {
+      padding: 0.6rem 1rem; margin: 0.25rem;
+      background: #1db954; border: none; border-radius: 8px;
+      cursor: pointer; font-weight: 600; color:#08130a;
     }
-    button:hover { background: #17a84a; }
-    #loader { display: none; margin-top: 1rem; }
-    #error { color: #f66; margin-top: 1rem; }
-    #progress { margin-top: 1rem; width: 80%; height: 1rem; background: #444; border-radius: 5px; overflow: hidden; margin-left: auto; margin-right: auto; display: none; }
-    #progress-bar { width: 0%; height: 100%; background: #1db954; }
-
-    /* Fixed video container */
+    .btn:hover { background:#17a84a; }
+    #loader { display:none; margin-top: 0.75rem; }
+    #error { color:#ff6b6b; margin-top: 0.75rem; min-height: 1.25rem; }
     #videoContainer {
-      width: 90%;           /* use percentage of viewport width */
-      max-width: 1200px;    /* optional max width for large screens */
-      aspect-ratio: 16 / 9; /* keep 16:9 frame */
-      background-color: black;
-      margin: 2rem auto 0;
-      border-radius: 10px;
+      width: 90%; max-width: 1200px; aspect-ratio: 16 / 9;
+      background: #000; margin: 1.5rem auto 0; border-radius: 12px;
       box-shadow: 0 0 15px rgba(0,0,0,0.5);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      overflow: hidden;
+      display:flex; align-items:center; justify-content:center; overflow:hidden;
     }
-
-    #videoContainer video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain; /* fit inside frame, black bars for portrait */
+    video {
+      width: 100%; height: 100%; object-fit: contain;
+      background:#000; border-radius: 12px;
     }
-
+    .time-grid { display:inline-grid; grid-template-columns: repeat(8, max-content); gap: 6px 8px; align-items: center; }
+    .time-grid input { width: 72px; padding: 0.35rem 0.5rem; border-radius: 6px; border: none; background:#1a1a1a; color:#fff; }
+    .sep { opacity: 0.6; }
+    small.hint { display:block; opacity:0.7; margin-top:0.5rem; }
   </style>
 </head>
 <body>
-  <h1>🎥 Google Drive API Video Player + Trimmer</h1>
-  <input id="driveLink" placeholder="Paste Google Drive video link here">
-  <button onclick="loadVideo()">Play</button>
+  <h1>🎥 Google Drive Video Player + Trimmer</h1>
 
-  <div style="margin-top:1rem;">
-    <label>Start Time:</label><br>
-    <input type="number" id="startHours" min="0" max="23" value="0" style="width:60px;"> :
-    <input type="number" id="startMinutes" min="0" max="59" value="0" style="width:60px;"> :
-    <input type="number" id="startSeconds" min="0" max="59" value="0" style="width:60px;"> .
-    <input type="number" id="startMillis"  min="0" max="999" value="0" style="width:80px;" placeholder="ms">
-  
-    <br><br>
-    <label>End Time:</label><br>
-    <input type="number" id="endHours" min="0" max="23" value="0" style="width:60px;"> :
-    <input type="number" id="endMinutes" min="0" max="59" value="0" style="width:60px;"> :
-    <input type="number" id="endSeconds" min="0" max="59" value="0" style="width:60px;"> .
-    <input type="number" id="endMillis"  min="0" max="999" value="0" style="width:80px;" placeholder="ms">
-  
-    <br><br>
-    <button onclick="previewTrim()">Preview Trim</button>
-    <button onclick="downloadTrim()">Download Trim</button>
+  <div class="row">
+    <input id="driveLink" type="text" placeholder="Paste a Google Drive link OR fileId (no need to load full video first)" />
+    <button class="btn" id="playBtn">Play full video</button>
   </div>
-  
-  
-  
-  
 
-  <div id="loader">⏳ Loading...</div>
-  <div id="progress"><div id="progress-bar"></div></div>
+  <div class="row">
+    <div class="time-grid">
+      <label for="startHours">Start</label>
+      <input type="number" id="startHours"   min="0" max="23" value="0"> <span class="sep">:</span>
+      <input type="number" id="startMinutes" min="0" max="59" value="0"> <span class="sep">:</span>
+      <input type="number" id="startSeconds" min="0" max="59" value="0"> <span class="sep">.</span>
+      <input type="number" id="startMillis"  min="0" max="999" value="0">
+
+      <label for="endHours" style="margin-left:12px;">End</label>
+      <input type="number" id="endHours"   min="0" max="23" value="0"> <span class="sep">:</span>
+      <input type="number" id="endMinutes" min="0" max="59" value="0"> <span class="sep">:</span>
+      <input type="number" id="endSeconds" min="0" max="59" value="0"> <span class="sep">.</span>
+      <input type="number" id="endMillis"  min="0" max="999" value="0">
+    </div>
+
+    <div class="row">
+      <button class="btn" id="previewBtn">Preview Trim</button>
+      <button class="btn" id="downloadBtn">Download Trim</button>
+      <small class="hint">Tip: whole seconds → fastest preview; milliseconds → precise re-encode.</small>
+    </div>
+  </div>
+
+  <div id="loader">⏳ Working…</div>
   <div id="error"></div>
   <div id="videoContainer"></div>
 
   <script>
+    // ---- Globals / state ----
     const noSleep = new NoSleep();
     let noSleepEnabled = false;
     let currentFileId = null;
+    let currentVideoEl = null;
+    let currentObjectUrl = null;
+    let previewAbort = null;
 
+    // ---- Helpers ----
     function extractFileId(url) {
       try {
-        // Handles all major Drive link formats
         const patterns = [
-          /\/d\/([a-zA-Z0-9_-]{25,})/,      // .../d/FILEID/...
-          /id=([a-zA-Z0-9_-]{25,})/,        // ?id=FILEID
-          /uc\?id=([a-zA-Z0-9_-]{25,})/,    // uc?id=FILEID
+          /\/d\/([a-zA-Z0-9_-]{25,})/,
+          /id=([a-zA-Z0-9_-]{25,})/,
+          /uc\?id=([a-zA-Z0-9_-]{25,})/,
         ];
         for (const p of patterns) {
           const m = url.match(p);
           if (m) return m[1];
         }
+        // if they pasted a raw fileId
+        if (/^[A-Za-z0-9_-]{20,}$/.test(url)) return url;
         return null;
-      } catch {
-        return null;
-      }
+      } catch { return null; }
     }
 
+    function $(id) { return document.getElementById(id); }
+    function setError(msg="") { $("error").textContent = msg; }
+    function setLoader(show) { $("loader").style.display = show ? "block" : "none"; }
 
-    async function loadVideo() {
-      const link = document.getElementById("driveLink").value.trim();
-      const fileId = extractFileId(link);
-      currentFileId = fileId;
-      const container = document.getElementById("videoContainer");
-      const error = document.getElementById("error");
-      const loader = document.getElementById("loader");
-
-      error.textContent = "";
-      container.innerHTML = "";
-      loader.style.display = "block";
-
-      if (!fileId) {
-        loader.style.display = "none";
-        error.textContent = "⚠️ Invalid Google Drive link.";
-        return;
-      }
-
-      try {
-        const metaRes = await fetch(`/video/${fileId}`, { method: "HEAD" });
-        if (!metaRes.ok) throw new Error("Video not accessible");
-
-        loader.style.display = "none";
-        container.innerHTML = `
-          <video id="video" playsinline autoplay muted controls loop>
-            <source src="/video/${fileId}" type="video/mp4">
-          </video>
-        `;
-
-        const video = document.getElementById("video");
-
-        document.addEventListener("click", function enable() {
-          if (!noSleepEnabled) {
-            noSleep.enable();
-            noSleepEnabled = true;
-          }
-          video.muted = false;
-          video.play().catch(()=>{});
-          document.removeEventListener("click", enable);
-        });
-
-      } catch (e) {
-        loader.style.display = "none";
-        error.textContent = "❌ " + e.message;
-      }
+    function clampInput(id, max) {
+      const el = $(id);
+      let v = parseInt(el.value, 10);
+      if (isNaN(v) || v < 0) v = 0;
+      if (v > max) v = max;
+      el.value = v;
+      return v;
     }
 
-    function sanitizeInput(id, max) {
-      const el = document.getElementById(id);
-      let val = parseInt(el.value, 10);
-      if (isNaN(val) || val < 0) val = 0;
-      if (val > max) val = max;
-      el.value = val; // keep UI in sync
-      return val;
-    }
-
-    // Returns both total seconds (float) and total milliseconds (int)
     function formatTimeFromInputs(prefix) {
-      const h  = sanitizeInput(prefix + "Hours", 23);
-      const m  = sanitizeInput(prefix + "Minutes", 59);
-      const s  = sanitizeInput(prefix + "Seconds", 59);
-      const ms = sanitizeInput(prefix + "Millis",  999);
+      const h  = clampInput(prefix + "Hours", 23);
+      const m  = clampInput(prefix + "Minutes", 59);
+      const s  = clampInput(prefix + "Seconds", 59);
+      const ms = clampInput(prefix + "Millis",  999);
       const totalMs = (h * 3600 + m * 60 + s) * 1000 + ms;
       return { seconds: totalMs / 1000, ms: totalMs };
     }
 
-    // Build /trim query: only send ms (and precise mode) when ms are non-zero
     function buildTrimQuery(fileId, startT, endT, { preview = false } = {}) {
       const params = new URLSearchParams({ fileId });
-
       const msNonZero = (startT.ms % 1000 !== 0) || (endT.ms % 1000 !== 0);
-
       if (msNonZero) {
         params.set("startMs", String(startT.ms));
-        params.set("endMs", String(endT.ms));
-        // server will auto precise when ms are sent, but we can be explicit:
-        params.set("mode", "precise");
+        params.set("endMs",   String(endT.ms));
+        params.set("mode",    "precise");
       } else {
-        // whole seconds -> keep copy mode (fast, low RAM)
         params.set("start", String(Math.floor(startT.seconds)));
         params.set("end",   String(Math.floor(endT.seconds)));
-        // do NOT set mode=precise
       }
-
       if (preview) params.set("preview", "1");
       return `/trim?${params.toString()}`;
     }
 
-
-    function getCurrentFileIdOrFromInput() {
-      // already known?
+    function getFileIdFromInput() {
       if (currentFileId) return currentFileId;
-
-      const link = document.getElementById("driveLink").value.trim();
-      if (!link) return null;
-
-      // allow either a full Drive URL or a bare fileId
-      const maybeIdFromUrl = extractFileId(link);
-      const id = maybeIdFromUrl || link; // if user pasted raw fileId
-
-      // Basic sanity check: Drive fileIds are usually >= 25 chars of [A-Za-z0-9_-]
-      if (!/^[A-Za-z0-9_-]{20,}$/.test(id)) return null;
-
-      currentFileId = id; // cache it for later
+      const raw = $("driveLink").value.trim();
+      const id = extractFileId(raw);
+      if (id) currentFileId = id;
       return id;
     }
 
+    // Kill previous preview/network + clean up video element & blob URL
+    function cancelInFlight(reason = "new-action") {
+      try { previewAbort?.abort(reason); } catch {}
+      previewAbort = null;
 
+      if (currentVideoEl) {
+        try { currentVideoEl.pause(); } catch {}
+        currentVideoEl.src = ""; // detach
+        currentVideoEl.remove();
+      }
+      if (currentObjectUrl) {
+        URL.revokeObjectURL(currentObjectUrl);
+        currentObjectUrl = null;
+      }
+      $("videoContainer").innerHTML = "";
+    }
 
-    async function previewTrim() {
-      const error = document.getElementById("error");
-      error.textContent = "";
+    // Always create a fresh <video> so mobile browsers reset their decoders & timelines cleanly
+    function mountVideo(src) {
+      const v = document.createElement("video");
+      v.controls = true;
+      v.autoplay = true;
+      v.loop = true;
+      v.muted = true;        // mobile autoplay policy
+      v.playsInline = true;  // iOS
+      v.preload = "metadata";
+      v.src = src;
+      v.addEventListener("loadedmetadata", () => { /* ready to scrub */ }, { once: true });
+      $("videoContainer").appendChild(v);
+      currentVideoEl = v;
 
-      const fileId = getCurrentFileIdOrFromInput();
-      if (!fileId) {
-        error.textContent = "⚠️ Paste a Google Drive link or file ID first.";
+      // Unmute on first gesture
+      const enable = () => { v.muted = false; v.play().catch(()=>{}); document.removeEventListener("click", enable); };
+      document.addEventListener("click", enable);
+    }
+
+    // ---- Play full video (optional) ----
+    async function loadVideo() {
+      setError("");
+      cancelInFlight();
+
+      const id = getFileIdFromInput();
+      if (!id) { setError("⚠️ Paste a Google Drive link or file ID first."); return; }
+
+      // HEAD check
+      setLoader(true);
+      try {
+        const metaRes = await fetch(`/video/${id}`, { method: "HEAD", cache: "no-store" });
+        if (!metaRes.ok) throw new Error("Video not accessible");
+      } catch (e) {
+        setLoader(false);
+        setError("❌ " + e.message);
         return;
       }
+
+      setLoader(false);
+      mountVideo(`/video/${id}`);
+      if (!noSleepEnabled) { noSleep.enable(); noSleepEnabled = true; }
+    }
+
+    // ---- Preview Trim (no need to load full video first) ----
+    async function previewTrim() {
+      setError("");
+      cancelInFlight(); // stop any previous preview/stream
+
+      const id = getFileIdFromInput();
+      if (!id) { setError("⚠️ Paste a Google Drive link or file ID first."); return; }
 
       const startT = formatTimeFromInputs("start");
       const endT   = formatTimeFromInputs("end");
+      if (endT.ms <= startT.ms) { setError("⚠️ End time must be after start time."); return; }
 
-      if (endT.ms <= startT.ms) {
-        error.textContent = "⚠️ End time must be after start time.";
-        return;
-      }
+      setLoader(true);
 
-      const container = document.getElementById("videoContainer");
-      container.innerHTML = "⏳ Trimming preview...";
-
-      // Only send ms/precise when milliseconds are non-zero
+      // Prepare body – only send ms when they matter
       const msNonZero = (startT.ms % 1000 !== 0) || (endT.ms % 1000 !== 0);
-      const body = { fileId, preview: true };
-
+      const body = { fileId: id, preview: true };
       if (msNonZero) {
-        body.startMs = startT.ms;
-        body.endMs   = endT.ms;
-        body.mode    = "precise";
+        body.startMs = startT.ms; body.endMs = endT.ms; body.mode = "precise";
       } else {
-        body.start = Math.floor(startT.seconds);
-        body.end   = Math.floor(endT.seconds);
+        body.start = Math.floor(startT.seconds); body.end = Math.floor(endT.seconds);
       }
+
+      // Make an abortable request
+      previewAbort = new AbortController();
+      const { signal } = previewAbort;
 
       try {
         const res = await fetch("/trim", {
           method: "POST",
           headers: { "Content-Type": "application/json", "Accept": "application/json" },
           cache: "no-store",
-          body: JSON.stringify(body)
+          body: JSON.stringify(body),
+          signal
         });
+
+        setLoader(false);
         if (!res.ok) throw new Error("Trim failed");
 
         const ct = res.headers.get("content-type") || "";
-        let videoSrc;
-
+        let src;
         if (ct.includes("application/json")) {
-          const { url } = await res.json();      // server returns /preview/:id
-          videoSrc = url;                         // range-enabled → scrubbable
+          const data = await res.json();
+          if (!data?.url) throw new Error("Missing preview URL");
+          src = data.url; // Range-enabled; best scrubbing
+        } else if (ct.startsWith("video/")) {
+          const blob = await res.blob();
+          src = currentObjectUrl = URL.createObjectURL(blob);
         } else {
-          const blob = await res.blob();          // fallback if server streamed MP4
-          videoSrc = URL.createObjectURL(blob);   // still scrubbable as blob URL
+          throw new Error("Unexpected response type");
         }
 
-        container.innerHTML = `
-          <video controls autoplay loop playsinline style="width:100%;border-radius:10px;">
-            <source src="${videoSrc}" type="video/mp4">
-          </video>
-        `;
-
-        const video = container.querySelector("video");
-        document.addEventListener("click", function enable() {
-          video.muted = false;
-          video.play().catch(()=>{});
-          document.removeEventListener("click", enable);
-        });
+        mountVideo(src);
+        if (!noSleepEnabled) { noSleep.enable(); noSleepEnabled = true; }
       } catch (err) {
-        container.innerHTML = "";
-        error.textContent = "❌ " + err.message;
+        if (err?.name === "AbortError") return; // canceled by us—ignore
+        setLoader(false);
+        setError("❌ " + err.message);
       }
     }
 
-
-
-
-
     function downloadTrim() {
-      const error = document.getElementById("error");
-      error.textContent = "";
-
-      const fileId = getCurrentFileIdOrFromInput();
-      if (!fileId) {
-        error.textContent = "⚠️ Paste a Google Drive link or file ID first.";
-        return;
-      }
+      setError("");
+      const id = getFileIdFromInput();
+      if (!id) { setError("⚠️ Paste a Google Drive link or file ID first."); return; }
 
       const startT = formatTimeFromInputs("start");
       const endT   = formatTimeFromInputs("end");
+      if (endT.ms <= startT.ms) { setError("⚠️ End time must be after start time."); return; }
 
-      if (endT.ms <= startT.ms) {
-        error.textContent = "⚠️ End time must be after start time.";
-        return;
-      }
-
-      const url = buildTrimQuery(fileId, startT, endT, { preview: false });
-      window.location.href = url;
+      const url = buildTrimQuery(id, startT, endT, { preview: false });
+      window.location.href = url; // browser download
     }
 
+    // ---- Wiring & lifecycle ----
+    $("playBtn").addEventListener("click", loadVideo);
+    $("previewBtn").addEventListener("click", previewTrim);
+    $("downloadBtn").addEventListener("click", downloadTrim);
 
-
-
-
-    // 🔧 Auto-correct time inputs live as the user types (now includes ms)
-    function clampValue(input, max) {
-      let val = parseInt(input.value, 10);
-      if (isNaN(val) || val < 0) val = 0;
-      if (val > max) val = max;
-      input.value = val;
-    }
-
-    // Apply live clamping to all hour/min/sec/ms inputs
+    // Clamp all time inputs
     ["startHours","startMinutes","startSeconds","startMillis",
-    "endHours","endMinutes","endSeconds","endMillis"].forEach(id => {
-      const el = document.getElementById(id);
-      const max = id.includes("Hours") ? 23 : id.includes("Millis") ? 999 : 59;
-      el.addEventListener("input", () => clampValue(el, max));
+     "endHours","endMinutes","endSeconds","endMillis"].forEach(id => {
+      $(id).addEventListener("input", () => {
+        const max = id.includes("Hours") ? 23 : id.includes("Millis") ? 999 : 59;
+        clampInput(id, max);
+      });
     });
 
-
-
+    // Abort/cleanup on page hide or unload (stops previous preview still loading on refresh)
+    window.addEventListener("beforeunload", () => cancelInFlight("unload"));
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") cancelInFlight("hidden");
+    });
   </script>
 </body>
-
 </html>

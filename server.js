@@ -5,16 +5,15 @@ import fs from "fs";
 import path from "path";
 import os from "node:os";
 import { exec } from "child_process";
-import util from "util";  // ✅ Added for promisified exec
+import util from "util";
 import ffmpegPath from "ffmpeg-static";
 import { spawn } from "child_process";
-
 
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY;
-const execPromise = util.promisify(exec); // ✅ for async ffmpeg commands
+const execPromise = util.promisify(exec);
 
 if (!API_KEY) {
   console.error("❌ Missing GOOGLE_API_KEY in .env file");
@@ -22,21 +21,22 @@ if (!API_KEY) {
 }
 
 app.use(express.static("public"));
-app.use(express.json()); // ✅ Added for JSON parsing (needed for POST /trim)
+app.use(express.json());
 
 // Track last downloaded temp file
 let lastTempFile = null;
-
 
 // Small concurrency gate (avoid 2 encodes at once on small plans)
 let inFlight = 0;
 const MAX_JOBS = 1;
 async function gate() {
   while (inFlight >= MAX_JOBS) {
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 100));
   }
   inFlight++;
-  return () => { inFlight--; };
+  return () => {
+    inFlight--;
+  };
 }
 
 function spawnFfmpeg(args) {
@@ -44,7 +44,27 @@ function spawnFfmpeg(args) {
   return spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
 }
 
-// Stream a finished file to client (no readFileSync) and unlink afterwards
+// Timed ffmpeg runner (kills on timeout); can also kill if client disconnects via onSpawn
+function runFfmpegWithTimeout(args, { timeoutMs = 90000, onSpawn } = {}) {
+  return new Promise((resolve, reject) => {
+    const ff = spawnFfmpeg(args);
+    onSpawn?.(ff);
+    let stderr = "";
+    const timer = setTimeout(() => {
+      try {
+        ff.kill("SIGKILL");
+      } catch {}
+      reject(new Error(`ffmpeg timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    ff.stderr.on("data", (d) => (stderr += d.toString()));
+    ff.on("close", (code) => {
+      clearTimeout(timer);
+      code === 0 ? resolve() : reject(new Error(stderr || `ffmpeg exited ${code}`));
+    });
+  });
+}
+
+// Stream a finished file to client and unlink afterwards
 function streamAndUnlink(filePath, res, { inline = false, filename = "trimmed_video.mp4" } = {}) {
   const headers = { "Content-Type": "video/mp4" };
   if (!inline) headers["Content-Disposition"] = `attachment; filename="${filename}"`;
@@ -53,10 +73,15 @@ function streamAndUnlink(filePath, res, { inline = false, filename = "trimmed_vi
   read.pipe(res);
   const cleanup = () => fs.unlink(filePath, () => {});
   read.on("close", cleanup);
-  read.on("error", (e) => { console.error("Stream error:", e); cleanup(); try { res.end(); } catch {} });
+  read.on("error", (e) => {
+    console.error("Stream error:", e);
+    cleanup();
+    try {
+      res.end();
+    } catch {}
+  });
   res.on("close", cleanup);
 }
-
 
 // --- Preview cache & route (seekable previews) ---
 const previews = new Map();
@@ -64,7 +89,6 @@ const previews = new Map();
 function makeId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
-
 function schedulePreviewCleanup(id, filePath, ms = 10 * 60 * 1000) {
   setTimeout(() => {
     previews.delete(id);
@@ -72,44 +96,104 @@ function schedulePreviewCleanup(id, filePath, ms = 10 * 60 * 1000) {
   }, ms);
 }
 
-// Serve preview files with Range (so timeline is scrubbable)
+// Range-capable file streamer
+function streamFile(req, res, filePath, mimeType) {
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunkSize = end - start + 1;
+    const stream = fs.createReadStream(filePath, { start, end });
+
+    res.writeHead(206, {
+      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": chunkSize,
+      "Content-Type": mimeType,
+    });
+    stream.pipe(res);
+  } else {
+    res.writeHead(200, {
+      "Content-Length": fileSize,
+      "Content-Type": mimeType,
+    });
+    fs.createReadStream(filePath).pipe(res);
+  }
+}
+
+// Serve preview files with Range (so timeline is scrubbable) + cache headers
 app.get("/preview/:id", (req, res) => {
   const filePath = previews.get(req.params.id);
   if (!filePath || !fs.existsSync(filePath)) {
     return res.status(404).send("Preview not found or expired.");
   }
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Cache-Control", "public, max-age=600");
   streamFile(req, res, filePath, "video/mp4");
 });
 
-
-// For previews: pipe ffmpeg -> client directly (lowest RAM)
+// For piping previews: fragmented mp4 to allow instant playback & scrubbing
 function pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQuality = true }, res) {
   const args = precise
     ? [
         "-nostdin",
-        "-i", srcPath,
-        "-ss", String(startSec),
-        "-t",  String(duration),
-        "-map", "0",
-        "-c:v", "libx264",
-        "-preset", previewQuality ? "ultrafast" : "veryfast",
-        "-crf",   previewQuality ? "26" : "20",
-        "-c:a", "aac", "-b:a", previewQuality ? "96k" : "192k",
-        "-threads", "1",
-        "-movflags", "frag_keyframe+empty_moov+faststart",
-        "-pix_fmt", "yuv420p",
-        "-f", "mp4", "-"
+        "-i",
+        srcPath,
+        "-ss",
+        String(startSec),
+        "-t",
+        String(duration),
+        "-map",
+        "0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        previewQuality ? "ultrafast" : "veryfast",
+        "-tune",
+        "zerolatency",
+        "-crf",
+        previewQuality ? "30" : "20",
+        "-c:a",
+        "aac",
+        "-b:a",
+        previewQuality ? "96k" : "192k",
+        "-threads",
+        "1",
+        "-movflags",
+        "frag_keyframe+empty_moov",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "mp4",
+        "-",
       ]
     : [
         "-nostdin",
-        "-ss", String(startSec),
-        "-t",  String(duration),
-        "-i", srcPath,
-        "-map", "0",
-        "-c", "copy",
-        "-threads", "1",
-        "-movflags", "frag_keyframe+empty_moov+faststart",
-        "-f", "mp4", "-"
+        "-ss",
+        String(startSec),
+        "-t",
+        String(duration),
+        "-i",
+        srcPath,
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-fflags",
+        "+genpts",
+        "-avoid_negative_ts",
+        "make_zero",
+        "-threads",
+        "1",
+        "-movflags",
+        "frag_keyframe+empty_moov",
+        "-f",
+        "mp4",
+        "-",
       ];
 
   const ff = spawnFfmpeg(args);
@@ -117,45 +201,49 @@ function pipeFfmpegToResponse({ srcPath, startSec, duration, precise, previewQua
   res.writeHead(200, {
     "Content-Type": "video/mp4",
     "Transfer-Encoding": "chunked",
-    "Cache-Control": "no-store"
+    "Cache-Control": "no-store",
   });
 
   let err = "";
   ff.stdout.pipe(res);
-  ff.stderr.on("data", d => (err += d.toString()));
+  ff.stderr.on("data", (d) => (err += d.toString()));
   ff.on("close", (code) => {
     if (code !== 0) {
       console.error("ffmpeg failed:", err || `code ${code}`);
       if (!res.headersSent) res.status(500).send("ffmpeg error");
-      else try { res.end(); } catch {}
+      else try {
+        res.end();
+      } catch {}
       return;
     }
-    try { res.end(); } catch {}
+    try {
+      res.end();
+    } catch {}
   });
 
-  // If client disconnects, kill ffmpeg
-  res.on("close", () => { try { ff.kill("SIGKILL"); } catch {} });
+  res.on("close", () => {
+    try {
+      ff.kill("SIGKILL");
+    } catch {}
+  });
 }
 
-
-
 // -------------------------
-// Helper: normalize times (supports seconds or milliseconds)
-// - Re-encode ONLY if:
-//   * ms are actually non-zero, OR
-//   * seconds include fractional part
+// Helper: normalize times (seconds or milliseconds)
+// Re-encode ONLY if ms actually non-zero or seconds have fractional part
 // -------------------------
 function normalizeTimes({ start, end, startMs, endMs }) {
-  // parse seconds or ms->s
-  const s = (start !== undefined && start !== null)
-    ? parseFloat(start)
-    : (startMs !== undefined && startMs !== null)
+  const s =
+    start !== undefined && start !== null
+      ? parseFloat(start)
+      : startMs !== undefined && startMs !== null
       ? parseFloat(startMs) / 1000
       : NaN;
 
-  const e = (end !== undefined && end !== null)
-    ? parseFloat(end)
-    : (endMs !== undefined && endMs !== null)
+  const e =
+    end !== undefined && end !== null
+      ? parseFloat(end)
+      : endMs !== undefined && endMs !== null
       ? parseFloat(endMs) / 1000
       : NaN;
 
@@ -164,28 +252,18 @@ function normalizeTimes({ start, end, startMs, endMs }) {
   }
   if (e <= s) throw new Error("End time must be after start time.");
 
-  // round to ms precision for ffmpeg
   const startSec = +s.toFixed(3);
-  const endSec   = +e.toFixed(3);
+  const endSec = +e.toFixed(3);
   const duration = +(endSec - startSec).toFixed(3);
 
-  // detect if ms actually matter (non-zero)
-  const sm = (startMs !== undefined && startMs !== null) ? parseInt(startMs, 10) : null;
-  const em = (endMs   !== undefined && endMs   !== null) ? parseInt(endMs,   10) : null;
-  const msNonZero =
-    (sm !== null && (sm % 1000) !== 0) ||
-    (em !== null && (em % 1000) !== 0);
+  const sm = startMs !== undefined && startMs !== null ? parseInt(startMs, 10) : null;
+  const em = endMs !== undefined && endMs !== null ? parseInt(endMs, 10) : null;
+  const msNonZero = (sm !== null && sm % 1000 !== 0) || (em !== null && em % 1000 !== 0);
+  const hasFraction = startSec % 1 !== 0 || endSec % 1 !== 0;
 
-  // also re-encode if seconds include fractional part
-  const hasFraction = (startSec % 1 !== 0) || (endSec % 1 !== 0);
-
-  // ✅ only force precise when needed
   const forcePrecise = msNonZero || hasFraction;
-
   return { startSec, duration, forcePrecise };
 }
-
-
 
 // -------------------------
 // Automatic cleanup of old temp videos
@@ -214,8 +292,6 @@ function cleanupTempFiles() {
     else console.log("Temp video cleanup complete.");
   });
 }
-
-// Run cleanup on server startup
 cleanupTempFiles();
 
 // -------------------------
@@ -246,38 +322,7 @@ async function downloadFile(fileId, filePath) {
 }
 
 // -------------------------
-// Stream file with range support
-// -------------------------
-function streamFile(req, res, filePath, mimeType) {
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
-
-  if (range) {
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-    const chunkSize = end - start + 1;
-    const stream = fs.createReadStream(filePath, { start, end });
-
-    res.writeHead(206, {
-      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-      "Accept-Ranges": "bytes",
-      "Content-Length": chunkSize,
-      "Content-Type": mimeType,
-    });
-    stream.pipe(res);
-  } else {
-    res.writeHead(200, {
-      "Content-Length": fileSize,
-      "Content-Type": mimeType,
-    });
-    fs.createReadStream(filePath).pipe(res);
-  }
-}
-
-// -------------------------
-// Main video route
+// Main video route (plays original file)
 // -------------------------
 app.get("/video/:fileId", async (req, res) => {
   try {
@@ -322,13 +367,13 @@ app.get("/video/:fileId", async (req, res) => {
 });
 
 // -------------------------
-// ✅ Trim video route (ms-accurate when ms provided)
+// Trim video (ms-accurate when ms provided)
 // -------------------------
 app.post("/trim", async (req, res) => {
-  const { fileId, start, end, startMs, endMs, preview, mode } = req.body; // mode: "precise"|"copy" (optional)
+  const { fileId, start, end, startMs, endMs, preview, mode } = req.body;
   if (!fileId) return res.status(400).send("Missing fileId.");
 
-  const release = await gate(); // limit concurrent encodes
+  const release = await gate();
   try {
     const { name } = await getFileMetadata(fileId);
     const srcPath = path.join(os.tmpdir(), name);
@@ -338,94 +383,154 @@ app.post("/trim", async (req, res) => {
       await downloadFile(fileId, srcPath);
     }
 
-    const { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
-    const precise = forcePrecise || mode === "precise"; // only re-encode when needed/forced
+    let { startSec, duration, forcePrecise } = normalizeTimes({ start, end, startMs, endMs });
+    if (preview) duration = Math.min(duration, 10); // keep previews snappy on tiny instances
 
-    // ✅ PREVIEW: write a small file to /tmp (faststart) and return a seekable URL
+    const precise = forcePrecise || mode === "precise";
+
     if (preview) {
+      // Write a small, seekable preview file and return its URL
       const outPath = path.join(os.tmpdir(), `preview_${Date.now()}.mp4`);
       const args = precise
         ? [
             "-nostdin",
-            "-i", srcPath,
-            "-ss", String(startSec),
-            "-t",  String(duration),
-            "-map", "0",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
-            "-c:a", "aac", "-b:a", "96k",
-            "-threads", "1",
-            "-movflags", "+faststart",
-            "-pix_fmt", "yuv420p",
-            "-y", outPath
+            "-i",
+            srcPath,
+            "-ss",
+            String(startSec),
+            "-t",
+            String(duration),
+            "-map",
+            "0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "30",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-threads",
+            "1",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+            outPath,
           ]
         : [
             "-nostdin",
-            "-ss", String(startSec),
-            "-t",  String(duration),
-            "-i", srcPath,
-            "-map", "0",
-            "-c", "copy",
-            "-threads", "1",
-            "-movflags", "+faststart",
-            "-y", outPath
+            "-ss",
+            String(startSec),
+            "-t",
+            String(duration),
+            "-i",
+            srcPath,
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-fflags",
+            "+genpts",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-threads",
+            "1",
+            "-movflags",
+            "frag_keyframe+empty_moov",
+            "-y",
+            outPath,
           ];
 
       console.log("ffmpeg (preview)", args.join(" "));
-      await new Promise((resolve, reject) => {
-        const ff = spawnFfmpeg(args);
-        let err = "";
-        ff.stderr.on("data", d => (err += d.toString()));
-        ff.on("close", code => (code === 0 ? resolve() : reject(new Error(err || `code ${code}`))));
+      await runFfmpegWithTimeout(args, {
+        onSpawn(ff) {
+          req.on("close", () => {
+            try {
+              ff.kill("SIGKILL");
+            } catch {}
+          });
+        },
+        timeoutMs: 120000,
       });
 
       const id = makeId();
       previews.set(id, outPath);
-      schedulePreviewCleanup(id, outPath); // auto-clean in ~10 min
+      schedulePreviewCleanup(id, outPath);
 
-      // after generating the file and id
       res.type("application/json");
       return res.json({ url: `/preview/${id}` });
-
     }
 
-
-    // ✅ DOWNLOAD: write to /tmp, then stream file (no readFileSync)
+    // DOWNLOAD: write to /tmp, then stream file
     const outPath = path.join(os.tmpdir(), `trimmed_${Date.now()}.mp4`);
     const args = precise
       ? [
           "-nostdin",
-          "-i", srcPath,
-          "-ss", String(startSec),
-          "-t",  String(duration),
-          "-map", "0",
-          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-          "-c:a", "aac", "-b:a", "192k",
-          "-threads", "1",
-          "-movflags", "+faststart",
-          "-pix_fmt", "yuv420p",
-          "-y", outPath
+          "-i",
+          srcPath,
+          "-ss",
+          String(startSec),
+          "-t",
+          String(duration),
+          "-map",
+          "0",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "veryfast",
+          "-crf",
+          "20",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "192k",
+          "-threads",
+          "1",
+          "-movflags",
+          "+faststart",
+          "-pix_fmt",
+          "yuv420p",
+          "-y",
+          outPath,
         ]
       : [
           "-nostdin",
-          "-ss", String(startSec),
-          "-t",  String(duration),
-          "-i", srcPath,
-          "-map", "0",
-          "-c", "copy",
-          "-threads", "1",
-          "-movflags", "+faststart",
-          "-y", outPath
+          "-ss",
+          String(startSec),
+          "-t",
+          String(duration),
+          "-i",
+          srcPath,
+          "-map",
+          "0",
+          "-c",
+          "copy",
+          "-threads",
+          "1",
+          "-movflags",
+          "+faststart",
+          "-y",
+          outPath,
         ];
 
     console.log("ffmpeg", args.join(" "));
-    await new Promise((resolve, reject) => {
-      const ff = spawnFfmpeg(args);
-      let err = "";
-      ff.stderr.on("data", d => (err += d.toString()));
-      ff.on("close", code => (code === 0 ? resolve() : reject(new Error(err || `code ${code}`))));
+    await runFfmpegWithTimeout(args, {
+      onSpawn(ff) {
+        req.on("close", () => {
+          try {
+            ff.kill("SIGKILL");
+          } catch {}
+        });
+      },
+      timeoutMs: 10 * 60 * 1000,
     });
 
-    // Stream file to client and unlink afterwards
     streamAndUnlink(outPath, res, { inline: false, filename: "trimmed_video.mp4" });
   } catch (err) {
     console.error(err);
@@ -435,14 +540,12 @@ app.post("/trim", async (req, res) => {
   }
 });
 
-
-
-// ✅ GET version (supports ms via startMs/endMs)
+// GET version (supports ms via startMs/endMs)
 app.get("/trim", async (req, res) => {
   const { fileId, start, end, startMs, endMs, mode } = req.query;
   if (!fileId) return res.status(400).send("Missing fileId.");
 
-  const release = await gate(); // limit concurrent encodes
+  const release = await gate();
   try {
     const { name } = await getFileMetadata(fileId);
     const srcPath = path.join(os.tmpdir(), name);
@@ -459,38 +562,65 @@ app.get("/trim", async (req, res) => {
     const args = precise
       ? [
           "-nostdin",
-          "-i", srcPath,
-          "-ss", String(startSec),
-          "-t",  String(duration),
-          "-map", "0",
-          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-          "-c:a", "aac", "-b:a", "192k",
-          "-threads", "1",
-          "-movflags", "+faststart",
-          "-pix_fmt", "yuv420p",
-          "-y", outPath
+          "-i",
+          srcPath,
+          "-ss",
+          String(startSec),
+          "-t",
+          String(duration),
+          "-map",
+          "0",
+          "-c:v",
+          "libx264",
+          "-preset",
+          "veryfast",
+          "-crf",
+          "20",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "192k",
+          "-threads",
+          "1",
+          "-movflags",
+          "+faststart",
+          "-pix_fmt",
+          "yuv420p",
+          "-y",
+          outPath,
         ]
       : [
           "-nostdin",
-          "-ss", String(startSec),
-          "-t",  String(duration),
-          "-i", srcPath,
-          "-map", "0",
-          "-c", "copy",
-          "-threads", "1",
-          "-movflags", "+faststart",
-          "-y", outPath
+          "-ss",
+          String(startSec),
+          "-t",
+          String(duration),
+          "-i",
+          srcPath,
+          "-map",
+          "0",
+          "-c",
+          "copy",
+          "-threads",
+          "1",
+          "-movflags",
+          "+faststart",
+          "-y",
+          outPath,
         ];
 
     console.log("ffmpeg", args.join(" "));
-    await new Promise((resolve, reject) => {
-      const ff = spawnFfmpeg(args);
-      let err = "";
-      ff.stderr.on("data", d => (err += d.toString()));
-      ff.on("close", code => (code === 0 ? resolve() : reject(new Error(err || `code ${code}`))));
+    await runFfmpegWithTimeout(args, {
+      onSpawn(ff) {
+        req.on("close", () => {
+          try {
+            ff.kill("SIGKILL");
+          } catch {}
+        });
+      },
+      timeoutMs: 10 * 60 * 1000,
     });
 
-    // Stream file to client and unlink afterwards
     streamAndUnlink(outPath, res, { inline: false, filename: "trimmed_video.mp4" });
   } catch (err) {
     console.error(err);
@@ -499,7 +629,5 @@ app.get("/trim", async (req, res) => {
     release();
   }
 });
-
-
 
 app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));
