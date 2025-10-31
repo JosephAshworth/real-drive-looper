@@ -204,12 +204,33 @@
     }
 
 
+    function getCurrentFileIdOrFromInput() {
+      // already known?
+      if (currentFileId) return currentFileId;
+
+      const link = document.getElementById("driveLink").value.trim();
+      if (!link) return null;
+
+      // allow either a full Drive URL or a bare fileId
+      const maybeIdFromUrl = extractFileId(link);
+      const id = maybeIdFromUrl || link; // if user pasted raw fileId
+
+      // Basic sanity check: Drive fileIds are usually >= 25 chars of [A-Za-z0-9_-]
+      if (!/^[A-Za-z0-9_-]{20,}$/.test(id)) return null;
+
+      currentFileId = id; // cache it for later
+      return id;
+    }
+
+
+
     async function previewTrim() {
       const error = document.getElementById("error");
       error.textContent = "";
 
-      if (!currentFileId) {
-        error.textContent = "⚠️ Please load a video first.";
+      const fileId = getCurrentFileIdOrFromInput();
+      if (!fileId) {
+        error.textContent = "⚠️ Paste a Google Drive link or file ID first.";
         return;
       }
 
@@ -226,7 +247,7 @@
 
       // Only send ms/precise when milliseconds are non-zero
       const msNonZero = (startT.ms % 1000 !== 0) || (endT.ms % 1000 !== 0);
-      const body = { fileId: currentFileId, preview: true };
+      const body = { fileId, preview: true };
 
       if (msNonZero) {
         body.startMs = startT.ms;
@@ -244,20 +265,17 @@
           cache: "no-store",
           body: JSON.stringify(body)
         });
-
         if (!res.ok) throw new Error("Trim failed");
 
         const ct = res.headers.get("content-type") || "";
         let videoSrc;
 
         if (ct.includes("application/json")) {
-          // Expected path: server returns { url: "/preview/<id>" }
-          const { url } = await res.json();
-          videoSrc = url; // served with Range -> scrubbable
+          const { url } = await res.json();      // server returns /preview/:id
+          videoSrc = url;                         // range-enabled → scrubbable
         } else {
-          // Fallback in case server sent an MP4 body (older code path)
-          const blob = await res.blob();
-          videoSrc = URL.createObjectURL(blob); // scrubbable via local blob URL
+          const blob = await res.blob();          // fallback if server streamed MP4
+          videoSrc = URL.createObjectURL(blob);   // still scrubbable as blob URL
         }
 
         container.innerHTML = `
@@ -266,7 +284,6 @@
           </video>
         `;
 
-        // unmute on first user gesture (mobile autoplay policy)
         const video = container.querySelector("video");
         document.addEventListener("click", function enable() {
           video.muted = false;
@@ -282,12 +299,14 @@
 
 
 
+
     function downloadTrim() {
       const error = document.getElementById("error");
       error.textContent = "";
 
-      if (!currentFileId) {
-        error.textContent = "⚠️ Please load a video first.";
+      const fileId = getCurrentFileIdOrFromInput();
+      if (!fileId) {
+        error.textContent = "⚠️ Paste a Google Drive link or file ID first.";
         return;
       }
 
@@ -299,10 +318,10 @@
         return;
       }
 
-      // ✅ Only send ms (and precise mode) if ms are actually non-zero
-      const url = buildTrimQuery(currentFileId, startT, endT, { preview: false });
-      window.location.href = url; // browser will download the streamed file
+      const url = buildTrimQuery(fileId, startT, endT, { preview: false });
+      window.location.href = url;
     }
+
 
 
 
